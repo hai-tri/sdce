@@ -35,9 +35,10 @@ def cross_entropy_loss(
             - (batch_size, seq_len, vocab_size) when using surrogate guidance
         labels: Target labels. Shape matches logits batch dimensions.
         perp_values: Perplexity values from surrogate model.
-            Shape: (batch_size, seq_len, k) where k is the number of top tokens
+            Shape: (batch_size, seq_len, max_tokens) where max_tokens is variable
+            based on probability threshold selection. Invalid entries are inf.
         perp_indices: Token indices from surrogate model (in surrogate vocab).
-            Shape: (batch_size, seq_len, k)
+            Shape: (batch_size, seq_len, max_tokens). Invalid entries are -1.
         lookup_surrogate_to_self_tokens: Lookup table mapping surrogate vocabulary
             indices to base model vocabulary indices. Shape: (surrogate_vocab_size,)
         surrogate_weight: Weight for the surrogate loss term (decays over training via cosine schedule)
@@ -53,7 +54,7 @@ def cross_entropy_loss(
         >>> # Standard cross-entropy (no surrogate)
         >>> loss, _ = cross_entropy_loss(logits, labels)
         
-        >>> # With surrogate guidance
+        >>> # With surrogate guidance (threshold-based selection)
         >>> loss, z_loss = cross_entropy_loss(
         ...     logits, labels,
         ...     perp_values=surr_perp_values,
@@ -73,17 +74,20 @@ def cross_entropy_loss(
         # Get dimensions
         if logits.dim() == 2:
             # Need to infer batch/seq dimensions from perp_indices
-            batch_size, seq_len, k = perp_indices.shape
+            batch_size, seq_len, max_tokens = perp_indices.shape
             vocab_size = logits.shape[-1]
             logits = logits.view(batch_size, seq_len, vocab_size)
             labels = labels.view(batch_size, seq_len)
         else:
             batch_size, seq_len, vocab_size = logits.shape
-            k = perp_indices.shape[-1]
+            max_tokens = perp_indices.shape[-1]
         
         # Translate surrogate indices to base model vocabulary
-        # Handle out-of-bounds by clamping (invalid translations remain -100)
-        translated_perp_indices = lookup_surrogate_to_self_tokens[perp_indices]
+        # Handle invalid indices (-1) by clamping first
+        valid_indices_mask = perp_indices >= 0
+        safe_perp_indices = perp_indices.clamp(min=0)
+        translated_perp_indices = lookup_surrogate_to_self_tokens[safe_perp_indices]
+        translated_perp_indices[~valid_indices_mask] = -100  # Mark invalid
         
         # Create mask for valid translations (not -100 and within vocab)
         valid_translation_mask = (translated_perp_indices >= 0) & (translated_perp_indices < vocab_size)
@@ -91,8 +95,8 @@ def cross_entropy_loss(
         # Clamp to valid range for gather operation (will be masked out anyway)
         safe_translated_indices = translated_perp_indices.clamp(0, vocab_size - 1)
         
-        # Gather logits for the translated top-k tokens
-        # gathered_logits: (batch_size, seq_len, k)
+        # Gather logits for the translated tokens
+        # gathered_logits: (batch_size, seq_len, max_tokens)
         gathered_logits = torch.gather(logits, dim=2, index=safe_translated_indices)
         
         # Compute log probabilities for gathered tokens
@@ -107,8 +111,10 @@ def cross_entropy_loss(
         # A position is valid if:
         # 1. Not all perp values are inf
         # 2. The translation is valid
+        # 3. The perp value itself is not inf (threshold-based selection)
         row_valid_mask = ~all_inf_mask.unsqueeze(-1)  # (batch_size, seq_len, 1)
-        combined_mask = row_valid_mask & valid_translation_mask  # (batch_size, seq_len, k)
+        token_valid_mask = ~torch.isinf(perp_values)  # (batch_size, seq_len, max_tokens)
+        combined_mask = row_valid_mask & valid_translation_mask & token_valid_mask
         
         # Count valid surrogate entries for normalization
         num_valid_surrogate = combined_mask.sum().item()
@@ -119,7 +125,7 @@ def cross_entropy_loss(
         masked_perp = perp_values.clone()
         masked_perp[~combined_mask] = float('inf')
         
-        # Softmax over k dimension (the top-k tokens)
+        # Softmax over the token dimension (the selected tokens)
         softmax_weights = F.softmax(-masked_perp, dim=-1)
         
         # Zero out invalid positions
@@ -199,41 +205,54 @@ def compute_perplexity_guidance(
     labels: torch.Tensor,
     lookup_base_to_surrogate: torch.Tensor,
     permitted_surrogate_ids: torch.Tensor,
-    k: int,
+    prob_threshold: float,
+    max_tokens: int = 100,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute top-k perplexity-based guidance from surrogate model.
+    Compute probability threshold-based guidance from surrogate model.
+    
+    Instead of selecting a fixed top-k tokens, this function selects all tokens
+    whose probability exceeds the specified threshold.
     
     Args:
         surrogate_logits: Logits from surrogate model. Shape: (batch, seq_len, surrogate_vocab)
         labels: Target labels in base model vocabulary. Shape: (batch, seq_len)
         lookup_base_to_surrogate: Lookup table from base vocab to surrogate vocab
         permitted_surrogate_ids: Surrogate token IDs that are in vocabulary intersection
-        k: Number of top tokens to select
+        prob_threshold: Probability threshold for token selection (e.g., 0.03 selects
+            tokens with probability > 0.03)
+        max_tokens: Maximum number of tokens to select per position (for memory efficiency).
+            Positions with more tokens above threshold will keep only the top max_tokens.
         
     Returns:
         Tuple of:
-        - perp_values: Perplexity values for top-k tokens. Shape: (batch, seq_len, k)
-        - perp_indices: Surrogate vocab indices for top-k tokens. Shape: (batch, seq_len, k)
+        - perp_values: Perplexity values for selected tokens. Shape: (batch, seq_len, max_tokens)
+            Invalid/padded entries are set to inf.
+        - perp_indices: Surrogate vocab indices for selected tokens. Shape: (batch, seq_len, max_tokens)
+            Invalid/padded entries are set to -1.
     """
     device = surrogate_logits.device
     batch_size, seq_len, vocab_size = surrogate_logits.shape
     
-    # Compute perplexity (reciprocal of probability)
+    # Compute probabilities from logits
     surrogate_probs = F.softmax(surrogate_logits, dim=-1)
+    
+    # Compute perplexity (reciprocal of probability)
     surrogate_perp = torch.reciprocal(surrogate_probs + 1e-8)
     
     # Mask tokens not in vocabulary intersection
     vocab_indices = torch.arange(vocab_size, device=device)
     not_in_intersection = ~torch.isin(vocab_indices, permitted_surrogate_ids)
+    surrogate_probs[:, :, not_in_intersection] = 0.0
     surrogate_perp[:, :, not_in_intersection] = float('inf')
     
     # Mask positions where labels are invalid
     invalid_label_mask = (labels == -100).unsqueeze(-1)
+    surrogate_probs = surrogate_probs.masked_fill(invalid_label_mask, 0.0)
     surrogate_perp = surrogate_perp.masked_fill(invalid_label_mask, float('inf'))
     
     # Translate labels to surrogate vocab and mask them out
-    # (we don't want to include the actual label in top-k)
+    # (we don't want to include the actual label in selection)
     safe_labels = labels.clone()
     safe_labels[labels == -100] = 0
     translated_labels = lookup_base_to_surrogate[safe_labels]
@@ -246,13 +265,28 @@ def compute_perplexity_guidance(
     safe_translated = translated_labels.clone()
     safe_translated[~valid_translation_mask] = 0
     
-    # Mask out the actual labels
+    # Mask out the actual labels (set their probability to 0)
+    surrogate_probs[batch_idx, seq_idx, safe_translated] = 0.0
     surrogate_perp[batch_idx, seq_idx, safe_translated] = float('inf')
     
-    # Get top-k lowest perplexity (highest confidence) tokens
-    topk_result = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1)
+    # Create mask for tokens above probability threshold
+    above_threshold_mask = surrogate_probs > prob_threshold
     
-    return topk_result.values, topk_result.indices
+    # Set perplexity to inf for tokens below threshold
+    surrogate_perp[~above_threshold_mask] = float('inf')
+    
+    # Get the top max_tokens lowest perplexity tokens (these are the ones above threshold)
+    # Using topk with largest=False gives us the smallest perplexities (highest probs)
+    topk_result = torch.topk(surrogate_perp, k=max_tokens, largest=False, sorted=True, dim=-1)
+    
+    perp_values = topk_result.values  # (batch, seq_len, max_tokens)
+    perp_indices = topk_result.indices  # (batch, seq_len, max_tokens)
+    
+    # Mark indices as invalid (-1) where perplexity is inf (below threshold or invalid)
+    invalid_mask = torch.isinf(perp_values)
+    perp_indices = perp_indices.masked_fill(invalid_mask, -1)
+    
+    return perp_values, perp_indices
 
 
 class SurrogateCrossEntropyLoss(torch.nn.Module):
@@ -292,6 +326,7 @@ class SurrogateCrossEntropyLoss(torch.nn.Module):
         labels: torch.Tensor,
         perp_values: Optional[torch.Tensor] = None,
         perp_indices: Optional[torch.Tensor] = None,
+        surrogate_weight: float = 1.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return cross_entropy_loss(
             logits=logits,
@@ -299,6 +334,7 @@ class SurrogateCrossEntropyLoss(torch.nn.Module):
             perp_values=perp_values,
             perp_indices=perp_indices,
             lookup_surrogate_to_self_tokens=self.lookup_table,
+            surrogate_weight=surrogate_weight,
             ignore_index=self.ignore_index,
             reduction=self.reduction,
             compute_z_loss=self.compute_z_loss,
