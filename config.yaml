@@ -22,8 +22,6 @@ surrogate:
   # weight = final + (initial - final) * 0.5 * (1 + cos(pi * step / total_steps))
   loss_weight_initial: 1.0  # Starting weight for surrogate loss
   loss_weight_final: 0.0    # Final weight (decays to this via cosine schedule)
-  loss_weight_initial: 1.0  # Initial weight for surrogate loss
-  loss_weight_final: 0.0    # Final weight after cosine decay (reaches this at end of training)
 
 # Data configuration
 data:
@@ -52,8 +50,17 @@ training:
   max_grad_norm: 1.0
   lr_scheduler_type: "cosine"  # cosine, linear, constant, etc.
   
+  # Device selection: "auto", "cuda", "mps", "tpu", "cpu"
+  device: "auto"
+  
+  # TPU-specific options (only used when device: "tpu")
+  tpu_cores: 1          # 1 for single core, 8 for TPU v3-8, etc.
+  tpu_metrics_debug: false
+  
   # Mixed precision training
-  mixed_precision: "fp16"  # fp16, bf16, or no
+  # - For GPU: "fp16" or "bf16" 
+  # - For TPU: "bf16" recommended (TPU v3+ native), "no" for float32
+  mixed_precision: "fp16"
   
   # Logging and checkpointing
   logging_steps: 10
@@ -72,6 +79,35 @@ training:
   # resume_from_checkpoint: "./outputs/checkpoint-1000"
   
   # Weights & Biases logging
-  # wandb_project: "surrogate-lm-training"
-  # wandb_run_name: "gpt2-with-qwen-surrogate"
-  # wandb_entity: "your-entity"
+  wandb_project: "project-name"
+  wandb_run_name: "run-name"
+  wandb_entity: "entity-name"
+
+# Benchmark evaluation configuration (lm-evaluation-harness)
+evaluation:
+  enabled: true                    # Enable/disable benchmark evaluation
+  eval_interval: 500              # Run benchmarks every N steps
+  
+  tasks:
+    - "hellaswag"
+    - "arc_easy"
+    - "piqa"
+    - "winogrande"
+    - "boolq"
+    - "mmlu"
+    - "gsm8k"
+    - "arc_challenge"
+    - 'arc_easy'
+    - 'lambada_openai'
+    - 'bbh'
+    - 'agieval'
+    - 'openbookqa'
+    - 'math'
+    
+  num_fewshot: 0                   # Number of few-shot examples (0 for zero-shot)
+  batch_size: 8                    # Batch size for evaluation
+  limit: null                      # Limit examples per task (null for all)
+  
+  # Logging options
+  log_individual_tasks: true       # Log score for each task separately
+  log_aggregate_score: true        # Log mean score across all tasks
