@@ -15,7 +15,13 @@ model:
 surrogate:
   name_or_path: "Qwen/Qwen3-0.6B"  # Surrogate model for guidance
   dtype: "float16"
-  k: 6              # Number of top-k tokens to consider from surrogate
+  # Probability threshold for token selection (replaces fixed k)
+  # Selects all surrogate tokens with probability > prob_threshold
+  # Example: 0.03 selects tokens with >3% probability
+  prob_threshold: 0.03
+  # Maximum tokens to consider per position (for memory efficiency)
+  # If more tokens exceed threshold, keeps top max_tokens by probability
+  max_tokens: 100
   enabled: true     # Set to false to disable surrogate guidance
   trust_remote_code: true
   # Surrogate loss weight scheduler (cosine decay, no warmup)
@@ -73,7 +79,7 @@ training:
   z_loss_multiplier: 1.0e-4
   
   # Random seed
-  seed: 42
+  seed: 67
   
   # Resume training
   # resume_from_checkpoint: "./outputs/checkpoint-1000"
@@ -88,6 +94,9 @@ evaluation:
   enabled: true                    # Enable/disable benchmark evaluation
   eval_interval: 500              # Run benchmarks every N steps
   
+  # Benchmark tasks to run
+  # Common options: "hellaswag", "arc_easy", "arc_challenge", "winogrande", 
+  # "piqa", "boolq", "lambada_openai", "mmlu", "truthfulqa_mc", "gsm8k"
   tasks:
     - "hellaswag"
     - "arc_easy"
