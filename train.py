@@ -42,12 +42,18 @@ from tqdm import tqdm
 
 # Optional: CUDA AMP
 try:
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.amp import autocast
+    from torch.cuda.amp import GradScaler
     HAS_CUDA_AMP = True
 except ImportError:
-    HAS_CUDA_AMP = False
-    GradScaler = None
-    autocast = None
+    try:
+        # Fallback for older PyTorch versions
+        from torch.cuda.amp import GradScaler, autocast
+        HAS_CUDA_AMP = True
+    except ImportError:
+        HAS_CUDA_AMP = False
+        GradScaler = None
+        autocast = None
 
 # Optional: PyTorch XLA for TPU support
 try:
@@ -135,7 +141,11 @@ class SurrogateConfig:
     """Configuration for the surrogate model."""
     name_or_path: str = "Qwen/Qwen3-0.6B"
     dtype: str = "float16"
-    k: int = 6  # Number of top-k tokens to consider from surrogate
+    # Probability threshold for token selection (replaces fixed k)
+    # Selects all surrogate tokens with probability > prob_threshold
+    prob_threshold: float = 0.03  # e.g., 0.03 selects tokens with >3% probability
+    # Maximum tokens to consider per position (for memory efficiency)
+    max_tokens: int = 100
     enabled: bool = True
     trust_remote_code: bool = False
     loss_weight_initial: float = 1.0  # Initial weight for surrogate loss
@@ -283,8 +293,10 @@ class Config:
         # Surrogate config
         if args.surrogate_model:
             config.surrogate.name_or_path = args.surrogate_model
-        if args.surrogate_k:
-            config.surrogate.k = args.surrogate_k
+        if args.surrogate_prob_threshold:
+            config.surrogate.prob_threshold = args.surrogate_prob_threshold
+        if args.surrogate_max_tokens:
+            config.surrogate.max_tokens = args.surrogate_max_tokens
         if args.no_surrogate:
             config.surrogate.enabled = False
         if args.surrogate_dtype:
@@ -383,8 +395,10 @@ def surrogate_cross_entropy_loss(
     Args:
         logits: Model output logits of shape (batch_size, seq_len, vocab_size) or (batch_size * seq_len, vocab_size)
         labels: Target labels of shape (batch_size, seq_len) or (batch_size * seq_len,)
-        perp_values: Perplexity values from surrogate model (batch_size, seq_len, k)
-        perp_indices: Token indices from surrogate model (batch_size, seq_len, k)
+        perp_values: Perplexity values from surrogate model (batch_size, seq_len, max_tokens)
+            Invalid entries are marked with inf.
+        perp_indices: Token indices from surrogate model (batch_size, seq_len, max_tokens)
+            Invalid entries are marked with -1.
         lookup_surrogate_to_self: Lookup table mapping surrogate vocab to base model vocab
         surrogate_weight: Weight for the surrogate loss term (decays over training)
         ignore_index: Index to ignore in loss computation
@@ -409,33 +423,44 @@ def surrogate_cross_entropy_loss(
             labels = labels.view(batch_size, seq_len)
         
         batch_size, seq_len, vocab_size = logits.shape
-        k = perp_indices.shape[-1]
+        max_tokens = perp_indices.shape[-1]
+        
+        # Handle invalid indices (-1) by clamping first, then masking
+        valid_indices_mask = perp_indices >= 0
+        safe_perp_indices = perp_indices.clamp(min=0)
         
         # Translate surrogate indices to base model indices
-        translated_perp_indices = lookup_surrogate_to_self[perp_indices]
+        translated_perp_indices = lookup_surrogate_to_self[safe_perp_indices]
+        translated_perp_indices[~valid_indices_mask] = -100  # Mark invalid
         
         # Handle invalid translations (-100 or out of bounds)
         valid_translation_mask = (translated_perp_indices >= 0) & (translated_perp_indices < vocab_size)
-        translated_perp_indices = translated_perp_indices.clamp(0, vocab_size - 1)
+        safe_translated_indices = translated_perp_indices.clamp(0, vocab_size - 1)
         
-        # Gather logits for the top-k tokens
-        gathered_logits = torch.gather(logits, dim=2, index=translated_perp_indices)
+        # Gather logits for the selected tokens
+        gathered_logits = torch.gather(logits, dim=2, index=safe_translated_indices)
         gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
         gathered_nll = -torch.log(gathered_logit_probs + 1e-10)
         
-        # Mask out invalid entries (where perp_values is inf or translation failed)
-        isinf_mask = torch.isinf(perp_values).all(dim=-1)  # (batch, seq)
-        valid_row_mask = (~isinf_mask).unsqueeze(-1) & valid_translation_mask  # (batch, seq, k)
+        # Combine validity masks:
+        # 1. perp_values not inf (token was above threshold)
+        # 2. perp_indices not -1 (valid index)
+        # 3. Translation succeeded
+        token_valid_mask = ~torch.isinf(perp_values)
+        combined_mask = token_valid_mask & valid_indices_mask & valid_translation_mask
+        
+        # Mask out invalid entries for entire rows (where all entries are invalid)
+        row_valid_mask = combined_mask.any(dim=-1)  # (batch, seq)
         
         # Count valid entries for normalization
-        num_valid_surrogate_entries = valid_row_mask.sum().item()
+        num_valid_surrogate_entries = combined_mask.sum().item()
         
         # Compute softmax weights from perplexity (lower perp = higher weight)
         # Mask invalid entries before softmax
         masked_perp_values = perp_values.clone()
-        masked_perp_values[~valid_row_mask] = float('inf')
+        masked_perp_values[~combined_mask] = float('inf')
         softmax_weights = F.softmax(-masked_perp_values, dim=-1)
-        softmax_weights = softmax_weights * valid_row_mask.float()
+        softmax_weights = softmax_weights * combined_mask.float()
         
         # Weighted surrogate loss (scaled by surrogate_weight)
         weighted_nll = gathered_nll * softmax_weights
@@ -711,6 +736,17 @@ def collate_fn(
     }
 
 
+class CollateFunction:
+    """Picklable collate function wrapper for multiprocessing DataLoader."""
+    
+    def __init__(self, pad_token_id: int, max_length: int):
+        self.pad_token_id = pad_token_id
+        self.max_length = max_length
+    
+    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        return collate_fn(batch, self.pad_token_id, self.max_length)
+
+
 def load_training_data(
     config: DataConfig,
     tokenizer: PreTrainedTokenizer,
@@ -961,12 +997,15 @@ class SurrogateTrainer:
         # For TPU, use fewer workers to avoid issues
         num_workers = 0 if self.is_tpu else self.config.data.preprocessing_num_workers
         
+        # Create picklable collate function for multiprocessing
+        collate = CollateFunction(pad_token_id, self.config.data.max_seq_length)
+        
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.training.per_device_train_batch_size,
             sampler=train_sampler,
             shuffle=(train_sampler is None),
-            collate_fn=lambda b: collate_fn(b, pad_token_id, self.config.data.max_seq_length),
+            collate_fn=collate,
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=True,
@@ -982,7 +1021,7 @@ class SurrogateTrainer:
                 self.eval_dataset,
                 batch_size=self.config.training.per_device_eval_batch_size,
                 shuffle=False,
-                collate_fn=lambda b: collate_fn(b, pad_token_id, self.config.data.max_seq_length),
+                collate_fn=collate,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
             )
@@ -1129,18 +1168,21 @@ class SurrogateTrainer:
         labels: torch.Tensor,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Compute top-k perplexity tokens from surrogate model.
+        Compute probability threshold-based guidance from surrogate model.
         
-        This method translates token IDs directly on GPU without decoding to strings,
-        making it fully GPU-parallelizable.
+        Instead of selecting a fixed top-k tokens, this method selects all tokens
+        whose probability exceeds the configured threshold.
         
         Returns:
             Tuple of (perp_values, perp_indices) or (None, None) if surrogate is disabled
+            - perp_values: shape (batch_size, seq_len-1, max_tokens), inf for invalid entries
+            - perp_indices: shape (batch_size, seq_len-1, max_tokens), -1 for invalid entries
         """
         if self.surrogate_model is None or not self.config.surrogate.enabled:
             return None, None
         
-        k = self.config.surrogate.k
+        prob_threshold = self.config.surrogate.prob_threshold
+        max_tokens = self.config.surrogate.max_tokens
         
         with torch.no_grad():
             input_ids = batch["input_ids"]  # (batch_size, seq_len)
@@ -1181,8 +1223,9 @@ class SurrogateTrainer:
             surr_vocab_size = surrogate_logits.shape[-1]
             label_seq_len = labels.shape[1]  # seq_len - 1 due to shift in get_labels
             
-            # Compute perplexity (inverse probability) - lower perp = higher confidence
+            # Compute probabilities from logits
             surrogate_probs = F.softmax(surrogate_logits, dim=-1)
+            # Compute perplexity (inverse probability) - lower perp = higher confidence
             surrogate_perp = torch.reciprocal(surrogate_probs + 1e-8)
             # Shape: (batch_size, seq_len-1, surr_vocab_size)
             
@@ -1192,18 +1235,21 @@ class SurrogateTrainer:
                 torch.arange(surr_vocab_size, device=self.device),
                 self.vocab_aligner.surrogate_permitted_ids,
             )
+            surrogate_probs[:, :, vocab_mask] = 0.0
             surrogate_perp[:, :, vocab_mask] = float('inf')
             
             # 2. Mask positions corresponding to labels=-100 (padding/ignored)
             invalid_label_positions = (labels == -100).unsqueeze(-1)
+            surrogate_probs = surrogate_probs.masked_fill(invalid_label_positions, 0.0)
             surrogate_perp = surrogate_perp.masked_fill(invalid_label_positions, float('inf'))
             
             # 3. Mask positions where the INPUT token was untranslatable
             #    (shifted by 1 to align with logits/labels which predict next token)
             untranslatable_positions = untranslatable_mask[:, 1:].unsqueeze(-1)
+            surrogate_probs = surrogate_probs.masked_fill(untranslatable_positions, 0.0)
             surrogate_perp = surrogate_perp.masked_fill(untranslatable_positions, float('inf'))
             
-            # 4. Mask out the actual target token (we don't want it in top-k)
+            # 4. Mask out the actual target token (we don't want it in selection)
             translated_labels = self.vocab_aligner.translate_base_to_surrogate(labels)
             valid_label_mask = translated_labels != -100
             
@@ -1213,13 +1259,23 @@ class SurrogateTrainer:
             # Use 0 for invalid labels to avoid indexing errors (they're already masked anyway)
             safe_translated_labels = translated_labels.clone()
             safe_translated_labels[~valid_label_mask] = 0
+            surrogate_probs[batch_indices, seq_indices, safe_translated_labels] = 0.0
             surrogate_perp[batch_indices, seq_indices, safe_translated_labels] = float('inf')
             
-            # === TOP-K SELECTION (fully on GPU) ===
-            # Select k tokens with lowest perplexity (highest confidence from surrogate)
-            topk_result = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1)
-            perp_values = topk_result.values   # (batch_size, seq_len-1, k)
-            perp_indices = topk_result.indices  # (batch_size, seq_len-1, k) - in surrogate vocab
+            # === PROBABILITY THRESHOLD SELECTION ===
+            # Mask tokens below the probability threshold
+            below_threshold_mask = surrogate_probs <= prob_threshold
+            surrogate_perp[below_threshold_mask] = float('inf')
+            
+            # Select up to max_tokens with lowest perplexity (highest probability above threshold)
+            topk_result = torch.topk(surrogate_perp, k=max_tokens, largest=False, sorted=True, dim=-1)
+            
+            perp_values = topk_result.values   # (batch_size, seq_len-1, max_tokens)
+            perp_indices = topk_result.indices  # (batch_size, seq_len-1, max_tokens) - in surrogate vocab
+            
+            # Mark indices as invalid (-1) where perplexity is inf (below threshold or invalid)
+            invalid_mask = torch.isinf(perp_values)
+            perp_indices = perp_indices.masked_fill(invalid_mask, -1)
             
         return perp_values, perp_indices
     
@@ -1240,11 +1296,11 @@ class SurrogateTrainer:
         
         # Forward pass with appropriate autocast context
         if self.use_autocast and not self.is_tpu:
-            # CUDA/MPS autocast
-            autocast_context = autocast(device_type=self.device.type, dtype=self.autocast_dtype)
+            # CUDA/MPS autocast - use torch.amp.autocast
+            autocast_context = torch.amp.autocast(device_type=self.device.type, dtype=self.autocast_dtype)
         elif self.is_tpu and self.autocast_dtype == torch.bfloat16:
             # TPU bfloat16 - use autocast if available in torch_xla
-            autocast_context = torch.autocast('xla', dtype=torch.bfloat16, enabled=True)
+            autocast_context = torch.amp.autocast('xla', dtype=torch.bfloat16, enabled=True)
         else:
             # No autocast
             from contextlib import nullcontext
@@ -1355,9 +1411,9 @@ class SurrogateTrainer:
         
         # Set up autocast context
         if self.use_autocast and not self.is_tpu:
-            autocast_context = autocast(device_type=self.device.type, dtype=self.autocast_dtype)
+            autocast_context = torch.amp.autocast(device_type=self.device.type, dtype=self.autocast_dtype)
         elif self.is_tpu and self.autocast_dtype == torch.bfloat16:
-            autocast_context = torch.autocast('xla', dtype=torch.bfloat16, enabled=True)
+            autocast_context = torch.amp.autocast('xla', dtype=torch.bfloat16, enabled=True)
         else:
             from contextlib import nullcontext
             autocast_context = nullcontext()
@@ -1582,7 +1638,7 @@ class SurrogateTrainer:
         logger.info(f"  Surrogate model enabled: {self.config.surrogate.enabled}")
         if self.config.surrogate.enabled:
             logger.info(f"  Surrogate model: {self.config.surrogate.name_or_path}")
-            logger.info(f"  Surrogate k: {self.config.surrogate.k}")
+            logger.info(f"  Surrogate prob_threshold: {self.config.surrogate.prob_threshold}")
         if self.config.evaluation.enabled:
             logger.info(f"  Benchmark tasks: {self.config.evaluation.tasks}")
             logger.info(f"  Benchmark eval interval: {self.config.evaluation.eval_interval}")
@@ -1821,7 +1877,8 @@ def parse_args() -> argparse.Namespace:
     
     # Surrogate arguments
     parser.add_argument("--surrogate_model", type=str, help="Surrogate model name or path")
-    parser.add_argument("--surrogate_k", type=int, help="Number of top-k tokens from surrogate")
+    parser.add_argument("--surrogate_prob_threshold", type=float, help="Probability threshold for token selection (e.g., 0.03)")
+    parser.add_argument("--surrogate_max_tokens", type=int, help="Maximum tokens to consider per position")
     parser.add_argument("--surrogate_dtype", type=str, choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--no_surrogate", action="store_true", help="Disable surrogate model")
     parser.add_argument("--surrogate_loss_weight_initial", type=float, help="Initial surrogate loss weight")
