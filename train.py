@@ -5,9 +5,17 @@ Surrogate-Assisted Language Model Training Script
 This script implements a training approach where a surrogate model guides the 
 primary model's learning by providing token-level perplexity signals.
 
+Supports: CUDA GPUs, Apple MPS, TPUs (via PyTorch XLA), and CPU.
+
 Usage:
     python train.py --config config.yaml
     python train.py --base_model gpt2 --surrogate_model Qwen/Qwen3-0.6B --dataset wikitext --dataset_config wikitext-2-raw-v1
+    
+    # For TPU (single core)
+    python train.py --config config.yaml --device tpu
+    
+    # For TPU (multi-core with xmp.spawn)
+    python train.py --config config.yaml --device tpu --tpu_cores 8
 """
 
 from __future__ import annotations
@@ -28,10 +36,31 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
+
+# Optional: CUDA AMP
+try:
+    from torch.cuda.amp import GradScaler, autocast
+    HAS_CUDA_AMP = True
+except ImportError:
+    HAS_CUDA_AMP = False
+    GradScaler = None
+    autocast = None
+
+# Optional: PyTorch XLA for TPU support
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    HAS_XLA = True
+except ImportError:
+    HAS_XLA = False
+    xm = None
+    pl = None
+    xmp = None
 
 try:
     import yaml
@@ -59,6 +88,18 @@ try:
     HAS_DATASETS = True
 except ImportError:
     HAS_DATASETS = False
+
+# lm-evaluation-harness for benchmarking
+try:
+    import lm_eval
+    from lm_eval.models.huggingface import HFLM
+    from lm_eval.evaluator import simple_evaluate
+    HAS_LM_EVAL = True
+except ImportError:
+    HAS_LM_EVAL = False
+    lm_eval = None
+    HFLM = None
+    simple_evaluate = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,6 +179,13 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     lr_scheduler_type: str = "cosine"
     
+    # Device selection: "auto", "cuda", "mps", "tpu", "cpu"
+    device: str = "auto"
+    
+    # TPU-specific options
+    tpu_cores: int = 1  # Number of TPU cores (1 for single, 8 for v3-8, etc.)
+    tpu_metrics_debug: bool = False  # Print TPU metrics for debugging
+    
     # Precision
     mixed_precision: str = "fp16"  # fp16, bf16, no
     
@@ -151,7 +199,7 @@ class TrainingConfig:
     use_z_loss: bool = False
     z_loss_multiplier: float = 1e-4
     
-    # Distributed
+    # Distributed (for DDP on GPU)
     local_rank: int = -1
     
     # Misc
@@ -165,12 +213,40 @@ class TrainingConfig:
 
 
 @dataclass
+class EvaluationConfig:
+    """Configuration for lm-evaluation-harness benchmarks."""
+    enabled: bool = True
+    eval_interval: int = 1000  # Run benchmarks every N steps
+    
+    # Benchmark tasks to run (from lm-evaluation-harness)
+    # Common options: "hellaswag", "arc_easy", "arc_challenge", "winogrande", 
+    # "piqa", "boolq", "lambada_openai", "mmlu", "truthfulqa_mc"
+    tasks: List[str] = field(default_factory=lambda: ["hellaswag", "arc_easy", "piqa"])
+    
+    # Number of few-shot examples (0 for zero-shot)
+    num_fewshot: int = 0
+    
+    # Batch size for evaluation
+    batch_size: int = 8
+    
+    # Limit number of examples per task (None for all)
+    limit: Optional[int] = None
+    
+    # Log individual task scores
+    log_individual_tasks: bool = True
+    
+    # Log aggregated score (mean across tasks)
+    log_aggregate_score: bool = True
+
+
+@dataclass
 class Config:
     """Main configuration combining all sub-configs."""
     model: ModelConfig = field(default_factory=ModelConfig)
     surrogate: SurrogateConfig = field(default_factory=SurrogateConfig)
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
@@ -186,6 +262,7 @@ class Config:
             surrogate=SurrogateConfig(**raw_config.get("surrogate", {})),
             data=DataConfig(**raw_config.get("data", {})),
             training=TrainingConfig(**raw_config.get("training", {})),
+            evaluation=EvaluationConfig(**raw_config.get("evaluation", {})),
         )
     
     @classmethod
@@ -264,6 +341,10 @@ class Config:
             config.training.use_z_loss = True
         if args.local_rank is not None:
             config.training.local_rank = args.local_rank
+        if hasattr(args, 'device') and args.device:
+            config.training.device = args.device
+        if hasattr(args, 'tpu_cores') and args.tpu_cores:
+            config.training.tpu_cores = args.tpu_cores
             
         return config
     
@@ -274,6 +355,7 @@ class Config:
             "surrogate": vars(self.surrogate),
             "data": vars(self.data),
             "training": vars(self.training),
+            "evaluation": vars(self.evaluation),
         }
         with open(path, "w") as f:
             json.dump(config_dict, f, indent=2)
@@ -411,6 +493,75 @@ def surrogate_cross_entropy_loss(
 
 
 # =============================================================================
+# Metrics and FLOPS Computation
+# =============================================================================
+
+@dataclass
+class SpeedMetrics:
+    """Track training speed and throughput metrics."""
+    start_time: float = 0.0
+    tokens_seen: int = 0
+    batches_seen: int = 0
+    total_tokens: int = 0  # Cumulative across all training
+    
+    def reset(self) -> None:
+        """Reset metrics for a new logging interval."""
+        self.start_time = time.time()
+        self.tokens_seen = 0
+        self.batches_seen = 0
+    
+    def update(self, batch_tokens: int) -> None:
+        """Update metrics with a new batch."""
+        self.tokens_seen += batch_tokens
+        self.batches_seen += 1
+        self.total_tokens += batch_tokens
+    
+    def get_metrics(self, world_size: int = 1) -> Dict[str, float]:
+        """Compute throughput metrics."""
+        elapsed = time.time() - self.start_time
+        if elapsed == 0:
+            elapsed = 1e-8
+        
+        return {
+            "tokens_per_second": self.tokens_seen / elapsed,
+            "tokens_per_second_global": (self.tokens_seen * world_size) / elapsed,
+            "batches_per_second": self.batches_seen / elapsed,
+            "total_tokens_trained": self.total_tokens * world_size,
+        }
+
+
+def estimate_model_flops(
+    model: PreTrainedModel,
+    batch_size: int,
+    seq_length: int,
+) -> Tuple[int, int]:
+    """
+    Estimate FLOPs for a transformer model forward and backward pass.
+    
+    Based on: https://arxiv.org/abs/2001.08361 (Scaling Laws for Neural Language Models)
+    Approximate FLOPs per token ≈ 6 * num_params (forward + backward)
+    Forward only ≈ 2 * num_params per token
+    
+    Returns:
+        Tuple of (flops_per_token, total_flops_per_batch)
+    """
+    # Count parameters
+    num_params = sum(p.numel() for p in model.parameters())
+    
+    # Approximate FLOPs: 2 * params for forward, 4 * params for backward (2x forward)
+    # Total = 6 * params per token
+    flops_per_token_forward = 2 * num_params
+    flops_per_token_backward = 4 * num_params
+    flops_per_token_total = flops_per_token_forward + flops_per_token_backward
+    
+    # Total FLOPs per batch
+    total_tokens = batch_size * seq_length
+    total_flops = flops_per_token_total * total_tokens
+    
+    return flops_per_token_total, total_flops
+
+
+# =============================================================================
 # Token Vocabulary Alignment
 # =============================================================================
 
@@ -447,30 +598,36 @@ class VocabularyAligner:
         base_vocab_size = len(base_vocab)
         surrogate_vocab_size = len(surrogate_vocab)
         
+        # Build index arrays on CPU first (much faster than individual GPU assignments)
+        base_ids = []
+        surrogate_ids = []
+        for token in intersection:
+            base_ids.append(base_vocab[token])
+            surrogate_ids.append(surrogate_vocab[token])
+        
+        base_ids_tensor = torch.tensor(base_ids, dtype=torch.long)
+        surrogate_ids_tensor = torch.tensor(surrogate_ids, dtype=torch.long)
+        
+        # Create lookup tables on CPU, then move to device
         # Base -> Surrogate
         self.lookup_base_to_surrogate = torch.full(
-            (base_vocab_size,), fill_value=-100, dtype=torch.long, device=self.device
+            (base_vocab_size,), fill_value=-100, dtype=torch.long
         )
+        self.lookup_base_to_surrogate[base_ids_tensor] = surrogate_ids_tensor
+        self.lookup_base_to_surrogate = self.lookup_base_to_surrogate.to(self.device)
         
         # Surrogate -> Base
         self.lookup_surrogate_to_base = torch.full(
-            (surrogate_vocab_size,), fill_value=-100, dtype=torch.long, device=self.device
+            (surrogate_vocab_size,), fill_value=-100, dtype=torch.long
         )
-        
-        # Populate lookup tables
-        for token in intersection:
-            base_id = base_vocab[token]
-            surrogate_id = surrogate_vocab[token]
-            self.lookup_base_to_surrogate[base_id] = surrogate_id
-            self.lookup_surrogate_to_base[surrogate_id] = base_id
+        self.lookup_surrogate_to_base[surrogate_ids_tensor] = base_ids_tensor
+        self.lookup_surrogate_to_base = self.lookup_surrogate_to_base.to(self.device)
         
         # Store permitted tokens
-        self.base_permitted_ids = torch.tensor(
-            [base_vocab[t] for t in intersection], device=self.device
-        )
-        self.surrogate_permitted_ids = torch.tensor(
-            [surrogate_vocab[t] for t in intersection], device=self.device
-        )
+        self.base_permitted_ids = base_ids_tensor.to(self.device)
+        self.surrogate_permitted_ids = surrogate_ids_tensor.to(self.device)
+        
+        logger.info("Lookup tables built successfully.")
         
     def translate_base_to_surrogate(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Translate base model token IDs to surrogate model token IDs."""
@@ -621,6 +778,7 @@ class SurrogateTrainer:
         eval_dataset: Optional[Dataset] = None,
         surrogate_model: Optional[PreTrainedModel] = None,
         surrogate_tokenizer: Optional[PreTrainedTokenizer] = None,
+        tpu_rank: Optional[int] = None,  # For TPU multi-core training
     ):
         self.config = config
         self.model = model
@@ -629,20 +787,25 @@ class SurrogateTrainer:
         self.eval_dataset = eval_dataset
         self.surrogate_model = surrogate_model
         self.surrogate_tokenizer = surrogate_tokenizer
+        self.tpu_rank = tpu_rank
         
-        # Setup device
+        # Setup device (TPU, GPU, MPS, or CPU)
         self.device = self._setup_device()
+        self.is_tpu = self.device.type == 'xla' if HAS_XLA else False
         
-        # Setup distributed training
-        self.is_distributed = config.training.local_rank != -1
+        # Setup distributed training (GPU DDP or TPU)
+        self.is_distributed = config.training.local_rank != -1 or (self.is_tpu and config.training.tpu_cores > 1)
         self.world_size = 1
         self.global_rank = 0
         self.local_rank = 0
         
-        if self.is_distributed:
+        if self.is_tpu and config.training.tpu_cores > 1:
+            self._setup_tpu_distributed()
+        elif config.training.local_rank != -1:
             self._setup_distributed()
         
         # Move models to device
+        logger.info(f"Moving models to device: {self.device}")
         self.model = self.model.to(self.device)
         if self.surrogate_model is not None:
             self.surrogate_model = self.surrogate_model.to(self.device)
@@ -651,23 +814,29 @@ class SurrogateTrainer:
         # Setup vocabulary alignment
         self.vocab_aligner = None
         if self.surrogate_model is not None and self.surrogate_tokenizer is not None:
+            logger.info("Building vocabulary alignment...")
             self.vocab_aligner = VocabularyAligner(
                 self.tokenizer,
                 self.surrogate_tokenizer,
                 self.device,
             )
+            logger.info("Vocabulary alignment complete.")
         
         # Setup data loaders
+        logger.info("Setting up data loaders...")
         self._setup_dataloaders()
+        logger.info("Data loaders ready.")
         
         # Setup optimizer and scheduler
+        logger.info("Setting up optimizer and scheduler...")
         self._setup_optimizer()
         
-        # Setup mixed precision
+        # Setup mixed precision (not used for TPU - TPU handles precision internally)
         self._setup_mixed_precision()
+        logger.info("Trainer initialization complete.")
         
-        # Distributed model wrapper
-        if self.is_distributed:
+        # Distributed model wrapper (GPU DDP only, not needed for TPU)
+        if config.training.local_rank != -1 and not self.is_tpu:
             self.model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
@@ -679,32 +848,102 @@ class SurrogateTrainer:
         self.epoch = 0
         self.best_eval_loss = float("inf")
         
+        # Speed and FLOPS metrics
+        self.speed_metrics = SpeedMetrics()
+        self.flops_per_token, self.flops_per_batch = estimate_model_flops(
+            self.model.module if hasattr(self.model, 'module') else self.model,
+            config.training.per_device_train_batch_size,
+            config.data.max_seq_length,
+        )
+        logger.info(f"Estimated FLOPs per token: {self.flops_per_token:,}")
+        logger.info(f"Estimated FLOPs per batch: {self.flops_per_batch:,}")
+        
         # Setup logging
         self._setup_logging()
         
     def _setup_device(self) -> torch.device:
-        """Setup compute device."""
-        if torch.cuda.is_available():
+        """Setup compute device based on configuration and availability."""
+        device_type = self.config.training.device.lower()
+        
+        if device_type == "tpu":
+            if not HAS_XLA:
+                raise RuntimeError("PyTorch XLA is required for TPU. Install with: pip install torch-xla")
+            device = xm.xla_device()
+            logger.info(f"Using TPU device: {device}")
+            return device
+        
+        elif device_type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA requested but not available")
             if self.config.training.local_rank != -1:
                 return torch.device("cuda", self.config.training.local_rank)
             return torch.device("cuda")
-        elif torch.backends.mps.is_available():
+        
+        elif device_type == "mps":
+            if not torch.backends.mps.is_available():
+                raise RuntimeError("MPS requested but not available")
             return torch.device("mps")
-        return torch.device("cpu")
+        
+        elif device_type == "cpu":
+            return torch.device("cpu")
+        
+        elif device_type == "auto":
+            # Auto-detect best available device
+            if HAS_XLA:
+                try:
+                    # Check if we're actually running on TPU
+                    device = xm.xla_device()
+                    # This will fail if not on TPU
+                    _ = torch.zeros(1, device=device)
+                    logger.info(f"Auto-detected TPU device: {device}")
+                    return device
+                except Exception:
+                    pass
+            
+            if torch.cuda.is_available():
+                if self.config.training.local_rank != -1:
+                    return torch.device("cuda", self.config.training.local_rank)
+                return torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                return torch.device("mps")
+            return torch.device("cpu")
+        
+        else:
+            raise ValueError(f"Unknown device type: {device_type}")
+    
+    def _setup_tpu_distributed(self) -> None:
+        """Setup distributed training for TPU."""
+        if not HAS_XLA:
+            raise RuntimeError("PyTorch XLA required for TPU distributed training")
+        
+        self.world_size = xm.xrt_world_size()
+        self.global_rank = xm.get_ordinal()
+        self.local_rank = xm.get_local_ordinal()
+        logger.info(f"TPU distributed training: rank {self.global_rank}/{self.world_size}")
     
     def _setup_distributed(self) -> None:
-        """Setup distributed training."""
+        """Setup distributed training for GPU (DDP)."""
         dist.init_process_group(backend="nccl")
         self.world_size = dist.get_world_size()
         self.global_rank = dist.get_rank()
         self.local_rank = self.config.training.local_rank
         torch.cuda.set_device(self.local_rank)
-        logger.info(f"Distributed training: rank {self.global_rank}/{self.world_size}")
+        logger.info(f"GPU distributed training: rank {self.global_rank}/{self.world_size}")
     
     def _setup_dataloaders(self) -> None:
         """Setup training and evaluation data loaders."""
         train_sampler = None
-        if self.is_distributed:
+        
+        # For TPU distributed training
+        if self.is_tpu and self.config.training.tpu_cores > 1:
+            train_sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=xm.xrt_world_size(),
+                rank=xm.get_ordinal(),
+                shuffle=True,
+            )
+        # For GPU distributed training
+        elif self.is_distributed and not self.is_tpu:
             train_sampler = DistributedSampler(
                 self.train_dataset,
                 num_replicas=self.world_size,
@@ -716,27 +955,42 @@ class SurrogateTrainer:
         if pad_token_id is None:
             pad_token_id = self.tokenizer.eos_token_id
         
+        # Don't use pin_memory for TPU
+        pin_memory = not self.is_tpu
+        
+        # For TPU, use fewer workers to avoid issues
+        num_workers = 0 if self.is_tpu else self.config.data.preprocessing_num_workers
+        
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.training.per_device_train_batch_size,
             sampler=train_sampler,
             shuffle=(train_sampler is None),
             collate_fn=lambda b: collate_fn(b, pad_token_id, self.config.data.max_seq_length),
-            num_workers=self.config.data.preprocessing_num_workers,
-            pin_memory=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
             drop_last=True,
         )
         
+        # Wrap with TPU parallel loader for efficient data transfer
+        if self.is_tpu and HAS_XLA:
+            self.train_loader = pl.MpDeviceLoader(self.train_loader, self.device)
+        
         self.eval_loader = None
         if self.eval_dataset is not None:
-            self.eval_loader = DataLoader(
+            eval_loader = DataLoader(
                 self.eval_dataset,
                 batch_size=self.config.training.per_device_eval_batch_size,
                 shuffle=False,
                 collate_fn=lambda b: collate_fn(b, pad_token_id, self.config.data.max_seq_length),
-                num_workers=self.config.data.preprocessing_num_workers,
-                pin_memory=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
             )
+            # Wrap eval loader for TPU
+            if self.is_tpu and HAS_XLA:
+                self.eval_loader = pl.MpDeviceLoader(eval_loader, self.device)
+            else:
+                self.eval_loader = eval_loader
     
     def _setup_optimizer(self) -> None:
         """Setup optimizer and learning rate scheduler."""
@@ -783,12 +1037,35 @@ class SurrogateTrainer:
         """Setup mixed precision training."""
         self.scaler = None
         self.autocast_dtype = torch.float32
+        self.use_autocast = False
         
-        if self.config.training.mixed_precision == "fp16":
-            self.scaler = GradScaler()
-            self.autocast_dtype = torch.float16
-        elif self.config.training.mixed_precision == "bf16":
-            self.autocast_dtype = torch.bfloat16
+        # TPU handles precision internally via XLA, no GradScaler needed
+        if self.is_tpu:
+            if self.config.training.mixed_precision == "bf16":
+                # TPU v3+ supports bfloat16 natively
+                self.autocast_dtype = torch.bfloat16
+                self.use_autocast = True
+                logger.info("TPU: Using bfloat16 precision")
+            else:
+                # TPU defaults to float32, XLA optimizes internally
+                logger.info("TPU: Using float32 precision (XLA will optimize)")
+            return
+        
+        # CUDA mixed precision
+        if self.device.type == "cuda":
+            if self.config.training.mixed_precision == "fp16" and HAS_CUDA_AMP:
+                self.scaler = GradScaler()
+                self.autocast_dtype = torch.float16
+                self.use_autocast = True
+            elif self.config.training.mixed_precision == "bf16":
+                self.autocast_dtype = torch.bfloat16
+                self.use_autocast = True
+        
+        # MPS mixed precision (limited support)
+        elif self.device.type == "mps":
+            if self.config.training.mixed_precision == "fp16":
+                self.autocast_dtype = torch.float16
+                self.use_autocast = True
     
     def _setup_logging(self) -> None:
         """Setup logging with Weights & Biases."""
@@ -854,6 +1131,9 @@ class SurrogateTrainer:
         """
         Compute top-k perplexity tokens from surrogate model.
         
+        This method translates token IDs directly on GPU without decoding to strings,
+        making it fully GPU-parallelizable.
+        
         Returns:
             Tuple of (perp_values, perp_indices) or (None, None) if surrogate is disabled
         """
@@ -863,68 +1143,83 @@ class SurrogateTrainer:
         k = self.config.surrogate.k
         
         with torch.no_grad():
-            # Decode batch to strings using base tokenizer
-            input_ids = batch["input_ids"]
-            batch_strings = self.tokenizer.batch_decode(input_ids.tolist(), skip_special_tokens=True)
+            input_ids = batch["input_ids"]  # (batch_size, seq_len)
+            attention_mask = batch.get("attention_mask")
+            batch_size, seq_len = input_ids.shape
             
-            # Re-encode with surrogate tokenizer
-            surrogate_encodings = self.surrogate_tokenizer(
-                batch_strings,
-                padding=True,
-                truncation=True,
-                max_length=self.config.data.max_seq_length,
-                return_tensors="pt",
-            ).to(self.device)
+            # === DIRECT GPU TOKEN TRANSLATION (no decode/re-encode) ===
+            # Translate base model token IDs to surrogate token IDs directly
+            surrogate_input_ids = self.vocab_aligner.lookup_base_to_surrogate[input_ids]
             
-            # Get surrogate model logits
-            surrogate_outputs = self.surrogate_model(**surrogate_encodings)
+            # Create mask for untranslatable tokens (those not in vocabulary intersection)
+            untranslatable_mask = (surrogate_input_ids == -100)
+            
+            # Replace untranslatable tokens with surrogate's pad token for forward pass
+            surrogate_pad_id = self.surrogate_tokenizer.pad_token_id
+            if surrogate_pad_id is None:
+                surrogate_pad_id = self.surrogate_tokenizer.eos_token_id
+            
+            surrogate_input_ids_safe = surrogate_input_ids.clone()
+            surrogate_input_ids_safe[untranslatable_mask] = surrogate_pad_id
+            
+            # Create attention mask: mask out untranslatable tokens
+            if attention_mask is not None:
+                surrogate_attention_mask = attention_mask.clone()
+                surrogate_attention_mask[untranslatable_mask] = 0
+            else:
+                surrogate_attention_mask = (~untranslatable_mask).long()
+            
+            # Forward pass through surrogate model (all on GPU)
+            surrogate_outputs = self.surrogate_model(
+                input_ids=surrogate_input_ids_safe,
+                attention_mask=surrogate_attention_mask,
+            )
+            # Shift logits to align with labels (next-token prediction)
+            # surrogate_logits: (batch_size, seq_len-1, vocab_size)
             surrogate_logits = surrogate_outputs.logits[..., :-1, :].contiguous()
             
-            batch_size, surr_seq_len, surr_vocab_size = surrogate_logits.shape
+            surr_vocab_size = surrogate_logits.shape[-1]
+            label_seq_len = labels.shape[1]  # seq_len - 1 due to shift in get_labels
             
-            # Compute perplexity (inverse probability)
+            # Compute perplexity (inverse probability) - lower perp = higher confidence
             surrogate_probs = F.softmax(surrogate_logits, dim=-1)
             surrogate_perp = torch.reciprocal(surrogate_probs + 1e-8)
+            # Shape: (batch_size, seq_len-1, surr_vocab_size)
             
-            # Align sequence lengths
-            base_seq_len = labels.shape[1]
-            min_seq_len = min(base_seq_len, surr_seq_len)
-            surrogate_perp = surrogate_perp[:, :min_seq_len, :]
-            
-            # Mask out tokens not in vocabulary intersection
+            # === MASKING === 
+            # 1. Mask out tokens not in vocabulary intersection (can't translate back)
             vocab_mask = ~torch.isin(
                 torch.arange(surr_vocab_size, device=self.device),
                 self.vocab_aligner.surrogate_permitted_ids,
             )
             surrogate_perp[:, :, vocab_mask] = float('inf')
             
-            # Mask positions corresponding to labels=-100
-            aligned_labels = labels[:, :min_seq_len]
-            invalid_positions = (aligned_labels == -100).unsqueeze(-1)
-            surrogate_perp[invalid_positions.expand_as(surrogate_perp)] = float('inf')
+            # 2. Mask positions corresponding to labels=-100 (padding/ignored)
+            invalid_label_positions = (labels == -100).unsqueeze(-1)
+            surrogate_perp = surrogate_perp.masked_fill(invalid_label_positions, float('inf'))
             
-            # Get top-k lowest perplexity tokens (exclude the actual label)
-            translated_labels = self.vocab_aligner.translate_base_to_surrogate(aligned_labels)
-            valid_mask = translated_labels != -100
+            # 3. Mask positions where the INPUT token was untranslatable
+            #    (shifted by 1 to align with logits/labels which predict next token)
+            untranslatable_positions = untranslatable_mask[:, 1:].unsqueeze(-1)
+            surrogate_perp = surrogate_perp.masked_fill(untranslatable_positions, float('inf'))
             
-            # Set perplexity of actual labels to inf so they're not selected
-            batch_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, min_seq_len)
-            seq_indices = torch.arange(min_seq_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
+            # 4. Mask out the actual target token (we don't want it in top-k)
+            translated_labels = self.vocab_aligner.translate_base_to_surrogate(labels)
+            valid_label_mask = translated_labels != -100
             
+            batch_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, label_seq_len)
+            seq_indices = torch.arange(label_seq_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
+            
+            # Use 0 for invalid labels to avoid indexing errors (they're already masked anyway)
             safe_translated_labels = translated_labels.clone()
-            safe_translated_labels[~valid_mask] = 0
+            safe_translated_labels[~valid_label_mask] = 0
             surrogate_perp[batch_indices, seq_indices, safe_translated_labels] = float('inf')
             
-            # Top-k selection
+            # === TOP-K SELECTION (fully on GPU) ===
+            # Select k tokens with lowest perplexity (highest confidence from surrogate)
             topk_result = torch.topk(surrogate_perp, k=k, largest=False, sorted=True, dim=-1)
-            perp_values = topk_result.values  # (batch, seq, k)
-            perp_indices = topk_result.indices  # (batch, seq, k)
-            
-            # Pad to match base model sequence length
-            if min_seq_len < base_seq_len:
-                pad_len = base_seq_len - min_seq_len
-                perp_values = F.pad(perp_values, (0, 0, 0, pad_len), value=float('inf'))
-                perp_indices = F.pad(perp_indices, (0, 0, 0, pad_len), value=0)
+            perp_values = topk_result.values   # (batch_size, seq_len-1, k)
+            perp_indices = topk_result.indices  # (batch_size, seq_len-1, k) - in surrogate vocab
             
         return perp_values, perp_indices
     
@@ -933,7 +1228,9 @@ class SurrogateTrainer:
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, float]:
         """Execute a single training step."""
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        # For TPU with MpDeviceLoader, data is already on device
+        if not self.is_tpu:
+            batch = {k: v.to(self.device) for k, v in batch.items()}
         
         # Get labels
         labels = self.get_labels(batch)
@@ -941,8 +1238,19 @@ class SurrogateTrainer:
         # Compute surrogate guidance
         perp_values, perp_indices = self.compute_surrogate_guidance(batch, labels)
         
-        # Forward pass
-        with autocast(device_type=self.device.type, dtype=self.autocast_dtype):
+        # Forward pass with appropriate autocast context
+        if self.use_autocast and not self.is_tpu:
+            # CUDA/MPS autocast
+            autocast_context = autocast(device_type=self.device.type, dtype=self.autocast_dtype)
+        elif self.is_tpu and self.autocast_dtype == torch.bfloat16:
+            # TPU bfloat16 - use autocast if available in torch_xla
+            autocast_context = torch.autocast('xla', dtype=torch.bfloat16, enabled=True)
+        else:
+            # No autocast
+            from contextlib import nullcontext
+            autocast_context = nullcontext()
+        
+        with autocast_context:
             outputs = self.model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch.get("attention_mask"),
@@ -1007,18 +1315,25 @@ class SurrogateTrainer:
             self.scaler.unscale_(self.optimizer)
         
         # Gradient clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.config.training.max_grad_norm,
-        )
-        metrics["grad_norm"] = grad_norm.item()
-        
-        # Optimizer step
-        if self.scaler is not None:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+        if self.is_tpu:
+            # TPU gradient clipping
+            grad_norm = xm.optimizer_step(self.optimizer, optimizer_args={'max_grad_norm': self.config.training.max_grad_norm})
+            # xm.optimizer_step doesn't return grad_norm, compute it separately if needed
+            xm.mark_step()
+            metrics["grad_norm"] = 0.0  # TPU doesn't easily expose this
         else:
-            self.optimizer.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.training.max_grad_norm,
+            )
+            metrics["grad_norm"] = grad_norm.item()
+            
+            # Optimizer step
+            if self.scaler is not None:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
         
         self.scheduler.step()
         self.optimizer.zero_grad()
@@ -1038,11 +1353,22 @@ class SurrogateTrainer:
         total_loss = 0.0
         total_tokens = 0
         
+        # Set up autocast context
+        if self.use_autocast and not self.is_tpu:
+            autocast_context = autocast(device_type=self.device.type, dtype=self.autocast_dtype)
+        elif self.is_tpu and self.autocast_dtype == torch.bfloat16:
+            autocast_context = torch.autocast('xla', dtype=torch.bfloat16, enabled=True)
+        else:
+            from contextlib import nullcontext
+            autocast_context = nullcontext()
+        
         for batch in tqdm(self.eval_loader, desc="Evaluating", disable=self.global_rank != 0):
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            # For TPU with MpDeviceLoader, data is already on device
+            if not self.is_tpu:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
             labels = self.get_labels(batch)
             
-            with autocast(device_type=self.device.type, dtype=self.autocast_dtype):
+            with autocast_context:
                 outputs = self.model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch.get("attention_mask"),
@@ -1057,13 +1383,25 @@ class SurrogateTrainer:
             num_tokens = (labels_flat != -100).sum().item()
             total_loss += loss.item()
             total_tokens += num_tokens
+            
+            # Mark step for TPU
+            if self.is_tpu:
+                xm.mark_step()
         
         # Aggregate across ranks
         if self.is_distributed:
             total_loss_tensor = torch.tensor(total_loss, device=self.device)
             total_tokens_tensor = torch.tensor(total_tokens, device=self.device)
-            dist.all_reduce(total_loss_tensor)
-            dist.all_reduce(total_tokens_tensor)
+            
+            if self.is_tpu:
+                # TPU all-reduce
+                total_loss_tensor = xm.all_reduce(xm.REDUCE_SUM, total_loss_tensor)
+                total_tokens_tensor = xm.all_reduce(xm.REDUCE_SUM, total_tokens_tensor)
+            else:
+                # GPU all-reduce
+                dist.all_reduce(total_loss_tensor)
+                dist.all_reduce(total_tokens_tensor)
+            
             total_loss = total_loss_tensor.item()
             total_tokens = total_tokens_tensor.item()
         
@@ -1076,6 +1414,101 @@ class SurrogateTrainer:
             "eval_loss": avg_loss,
             "eval_perplexity": perplexity,
         }
+    
+    def run_benchmarks(self) -> Dict[str, float]:
+        """
+        Run lm-evaluation-harness benchmarks and return scores.
+        
+        Returns:
+            Dictionary of benchmark scores
+        """
+        if not self.config.evaluation.enabled:
+            return {}
+        
+        if not HAS_LM_EVAL:
+            logger.warning(
+                "lm-evaluation-harness not installed. "
+                "Install with: pip install lm-eval"
+            )
+            return {}
+        
+        if self.global_rank != 0:
+            # Only run benchmarks on main process
+            return {}
+        
+        logger.info(f"Running benchmarks: {self.config.evaluation.tasks}")
+        
+        self.model.eval()
+        
+        try:
+            # Get the underlying model (unwrap DDP if necessary)
+            model_to_eval = self.model.module if hasattr(self.model, "module") else self.model
+            
+            # Create lm-eval model wrapper
+            lm_model = HFLM(
+                pretrained=model_to_eval,
+                tokenizer=self.tokenizer,
+                batch_size=self.config.evaluation.batch_size,
+                device=str(self.device),
+            )
+            
+            # Run evaluation
+            results = simple_evaluate(
+                model=lm_model,
+                tasks=self.config.evaluation.tasks,
+                num_fewshot=self.config.evaluation.num_fewshot,
+                limit=self.config.evaluation.limit,
+                log_samples=False,
+            )
+            
+            # Extract metrics
+            benchmark_metrics = {}
+            task_scores = []
+            
+            for task_name, task_results in results.get("results", {}).items():
+                # Get the main accuracy/score metric
+                if "acc" in task_results:
+                    score = task_results["acc"]
+                    metric_name = "acc"
+                elif "acc_norm" in task_results:
+                    score = task_results["acc_norm"]
+                    metric_name = "acc_norm"
+                elif "exact_match" in task_results:
+                    score = task_results["exact_match"]
+                    metric_name = "exact_match"
+                else:
+                    # Take first numeric metric
+                    for k, v in task_results.items():
+                        if isinstance(v, (int, float)) and not k.endswith("_stderr"):
+                            score = v
+                            metric_name = k
+                            break
+                    else:
+                        continue
+                
+                task_scores.append(score)
+                
+                if self.config.evaluation.log_individual_tasks:
+                    benchmark_metrics[f"benchmark/{task_name}/{metric_name}"] = score
+                    
+                    # Also log stderr if available
+                    stderr_key = f"{metric_name}_stderr"
+                    if stderr_key in task_results:
+                        benchmark_metrics[f"benchmark/{task_name}/{stderr_key}"] = task_results[stderr_key]
+            
+            # Compute aggregate score
+            if self.config.evaluation.log_aggregate_score and task_scores:
+                benchmark_metrics["benchmark/average_score"] = sum(task_scores) / len(task_scores)
+            
+            logger.info(f"Benchmark results: {benchmark_metrics}")
+            
+        except Exception as e:
+            logger.error(f"Error running benchmarks: {e}")
+            benchmark_metrics = {}
+        
+        self.model.train()
+        
+        return benchmark_metrics
     
     def save_checkpoint(self, path: str) -> None:
         """Save model checkpoint."""
@@ -1150,6 +1583,9 @@ class SurrogateTrainer:
         if self.config.surrogate.enabled:
             logger.info(f"  Surrogate model: {self.config.surrogate.name_or_path}")
             logger.info(f"  Surrogate k: {self.config.surrogate.k}")
+        if self.config.evaluation.enabled:
+            logger.info(f"  Benchmark tasks: {self.config.evaluation.tasks}")
+            logger.info(f"  Benchmark eval interval: {self.config.evaluation.eval_interval}")
         
         # Resume from checkpoint if specified
         if self.config.training.resume_from_checkpoint:
@@ -1158,15 +1594,23 @@ class SurrogateTrainer:
         self.model.train()
         self.optimizer.zero_grad()
         
-        # Training metrics
+        # Initialize speed metrics
+        self.speed_metrics.reset()
         running_loss = 0.0
+        running_grad_norm = 0.0
         running_steps = 0
-        start_time = time.time()
+        
+        # Compute batch tokens
+        batch_tokens = (
+            self.config.training.per_device_train_batch_size 
+            * self.config.data.max_seq_length
+        )
+        global_batch_tokens = batch_tokens * self.world_size * self.config.training.gradient_accumulation_steps
         
         for epoch in range(self.epoch, self.config.training.num_epochs):
             self.epoch = epoch
             
-            if self.is_distributed:
+            if self.is_distributed and hasattr(self.train_loader, 'sampler'):
                 self.train_loader.sampler.set_epoch(epoch)
             
             progress_bar = tqdm(
@@ -1181,42 +1625,70 @@ class SurrogateTrainer:
                 running_loss += metrics["loss"]
                 running_steps += 1
                 
+                # Update speed metrics
+                self.speed_metrics.update(batch_tokens)
+                
                 # Optimizer step (with gradient accumulation)
                 if (step + 1) % self.config.training.gradient_accumulation_steps == 0:
                     optim_metrics = self.optimizer_step()
                     self.global_step += 1
+                    running_grad_norm += optim_metrics["grad_norm"]
                     
                     # Logging
                     if self.global_step % self.config.training.logging_steps == 0:
                         avg_loss = running_loss / running_steps
-                        elapsed = time.time() - start_time
-                        tokens_per_sec = (
-                            running_steps
-                            * self.config.training.per_device_train_batch_size
-                            * self.config.data.max_seq_length
-                            * self.world_size
-                        ) / elapsed
+                        avg_grad_norm = running_grad_norm / (self.global_step % self.config.training.logging_steps or self.config.training.logging_steps)
+                        
+                        # Get speed metrics
+                        speed = self.speed_metrics.get_metrics(self.world_size)
+                        
+                        # Compute FLOPS metrics
+                        flops_per_second = speed["tokens_per_second_global"] * self.flops_per_token
+                        flops_per_second_per_device = speed["tokens_per_second"] * self.flops_per_token
+                        total_flops = self.speed_metrics.total_tokens * self.world_size * self.flops_per_token
                         
                         log_metrics = {
+                            # Training metrics
                             "train/loss": avg_loss,
                             "train/perplexity": math.exp(min(avg_loss, 20)),
                             "train/learning_rate": optim_metrics["learning_rate"],
-                            "train/grad_norm": optim_metrics["grad_norm"],
-                            "train/tokens_per_second": tokens_per_sec,
-                            "train/global_step": self.global_step,
+                            "train/grad_norm": avg_grad_norm,
+                            "train/surrogate_weight": metrics.get("surrogate_weight", 0.0),
+                            
+                            # Throughput metrics
+                            "throughput/tokens_per_second": speed["tokens_per_second_global"],
+                            "throughput/tokens_per_second_per_device": speed["tokens_per_second"],
+                            "throughput/batches_per_second": speed["batches_per_second"],
+                            "throughput/total_tokens_trained": speed["total_tokens_trained"],
+                            
+                            # FLOPS metrics
+                            "flops/total_tflops": total_flops / 1e12,
+                            "flops/tflops_per_second": flops_per_second / 1e12,
+                            "flops/tflops_per_second_per_device": flops_per_second_per_device / 1e12,
+                            
+                            # Progress
+                            "progress/global_step": self.global_step,
+                            "progress/epoch": epoch,
+                            "progress/percent_complete": (self.global_step / self.total_training_steps) * 100,
                         }
                         
                         if self.global_rank == 0:
-                            progress_bar.set_postfix(loss=f"{avg_loss:.4f}", ppl=f"{math.exp(min(avg_loss, 20)):.2f}")
+                            progress_bar.set_postfix(
+                                loss=f"{avg_loss:.4f}", 
+                                ppl=f"{math.exp(min(avg_loss, 20)):.2f}",
+                                tok_s=f"{speed['tokens_per_second_global']:.0f}"
+                            )
                             
                             if HAS_WANDB and wandb.run is not None:
                                 wandb.log(log_metrics, step=self.global_step)
                         
+                        # Reset running metrics
                         running_loss = 0.0
+                        running_grad_norm = 0.0
                         running_steps = 0
-                        start_time = time.time()
+                        self.speed_metrics.reset()
                     
-                    # Evaluation
+                    # Evaluation (loss-based)
                     if self.global_step % self.config.training.eval_steps == 0:
                         eval_metrics = self.evaluate()
                         
@@ -1231,6 +1703,17 @@ class SurrogateTrainer:
                                 self.best_eval_loss = eval_metrics["eval_loss"]
                                 best_path = os.path.join(self.config.training.output_dir, "best_model")
                                 self.save_checkpoint(best_path)
+                    
+                    # Benchmark evaluation (lm-eval-harness)
+                    if (self.config.evaluation.enabled and 
+                        self.global_step % self.config.evaluation.eval_interval == 0):
+                        benchmark_metrics = self.run_benchmarks()
+                        
+                        if benchmark_metrics and self.global_rank == 0:
+                            logger.info(f"Step {self.global_step} benchmarks: {benchmark_metrics}")
+                            
+                            if HAS_WANDB and wandb.run is not None:
+                                wandb.log(benchmark_metrics, step=self.global_step)
                     
                     # Save checkpoint
                     if self.global_step % self.config.training.save_steps == 0:
@@ -1250,10 +1733,22 @@ class SurrogateTrainer:
             if self.global_step >= self.total_training_steps:
                 break
         
-        # Final evaluation and save
+        # Final evaluation
+        logger.info("Running final evaluation...")
         eval_metrics = self.evaluate()
         if eval_metrics and self.global_rank == 0:
             logger.info(f"Final evaluation: {eval_metrics}")
+            if HAS_WANDB and wandb.run is not None:
+                wandb.log(eval_metrics, step=self.global_step)
+        
+        # Final benchmarks
+        if self.config.evaluation.enabled:
+            logger.info("Running final benchmarks...")
+            benchmark_metrics = self.run_benchmarks()
+            if benchmark_metrics and self.global_rank == 0:
+                logger.info(f"Final benchmarks: {benchmark_metrics}")
+                if HAS_WANDB and wandb.run is not None:
+                    wandb.log(benchmark_metrics, step=self.global_step)
         
         final_path = os.path.join(self.config.training.output_dir, "final_model")
         self.save_checkpoint(final_path)
@@ -1283,8 +1778,13 @@ class SurrogateTrainer:
     
     def close(self) -> None:
         """Cleanup resources."""
-        if self.is_distributed:
+        # GPU distributed cleanup
+        if self.is_distributed and not self.is_tpu:
             dist.destroy_process_group()
+        
+        # TPU cleanup - rendezvous to ensure all cores finish
+        if self.is_tpu and HAS_XLA:
+            xm.rendezvous("training_complete")
         
         if HAS_WANDB and wandb.run is not None and self.global_rank == 0:
             wandb.finish()
@@ -1361,7 +1861,59 @@ def parse_args() -> argparse.Namespace:
     # Distributed training
     parser.add_argument("--local_rank", type=int, default=-1)
     
+    # Device selection
+    parser.add_argument("--device", type=str, choices=["auto", "cuda", "mps", "tpu", "cpu"],
+                        default="auto", help="Device to use for training")
+    parser.add_argument("--tpu_cores", type=int, default=1, 
+                        help="Number of TPU cores (1 for single, 8 for v3-8)")
+    
     return parser.parse_args()
+
+
+def _train_fn(rank: int, config: Config, base_tokenizer, surrogate_tokenizer, train_dataset, eval_dataset):
+    """Training function for TPU multi-core training via xmp.spawn."""
+    # Set seed with rank offset for different data ordering
+    set_seed(config.training.seed + rank)
+    
+    # Initialize models (each core loads its own copy)
+    logger.info(f"[Rank {rank}] Loading base model: {config.model.name_or_path}")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.model.name_or_path,
+        torch_dtype=config.model.get_torch_dtype(),
+        trust_remote_code=config.model.trust_remote_code,
+    )
+    
+    if config.model.gradient_checkpointing:
+        base_model.gradient_checkpointing_enable()
+    
+    surrogate_model = None
+    if config.surrogate.enabled:
+        logger.info(f"[Rank {rank}] Loading surrogate model: {config.surrogate.name_or_path}")
+        surrogate_model = AutoModelForCausalLM.from_pretrained(
+            config.surrogate.name_or_path,
+            torch_dtype=config.surrogate.get_torch_dtype(),
+            trust_remote_code=config.surrogate.trust_remote_code,
+        )
+        surrogate_model.eval()
+        for param in surrogate_model.parameters():
+            param.requires_grad = False
+    
+    # Initialize trainer
+    trainer = SurrogateTrainer(
+        config=config,
+        model=base_model,
+        tokenizer=base_tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        surrogate_model=surrogate_model,
+        surrogate_tokenizer=surrogate_tokenizer,
+        tpu_rank=rank,
+    )
+    
+    try:
+        trainer.train()
+    finally:
+        trainer.close()
 
 
 def main():
@@ -1374,7 +1926,10 @@ def main():
         # Override with command line arguments
         if args.base_model:
             config.model.name_or_path = args.base_model
-        # ... (add other overrides as needed)
+        if hasattr(args, 'device') and args.device:
+            config.training.device = args.device
+        if hasattr(args, 'tpu_cores') and args.tpu_cores:
+            config.training.tpu_cores = args.tpu_cores
     else:
         config = Config.from_args(args)
     
@@ -1384,7 +1939,7 @@ def main():
     # Create output directory
     os.makedirs(config.training.output_dir, exist_ok=True)
     
-    # Initialize tokenizers
+    # Initialize tokenizers (shared across TPU cores)
     logger.info(f"Loading base tokenizer: {config.model.name_or_path}")
     base_tokenizer = AutoTokenizer.from_pretrained(
         config.model.name_or_path,
@@ -1404,48 +1959,63 @@ def main():
         if surrogate_tokenizer.pad_token is None:
             surrogate_tokenizer.pad_token = surrogate_tokenizer.eos_token
     
-    # Load datasets
+    # Load datasets (shared across TPU cores)
     logger.info("Loading datasets...")
     train_dataset, eval_dataset = load_training_data(config.data, base_tokenizer)
     
-    # Initialize models
-    logger.info(f"Loading base model: {config.model.name_or_path}")
-    base_model = AutoModelForCausalLM.from_pretrained(
-        config.model.name_or_path,
-        torch_dtype=config.model.get_torch_dtype(),
-        trust_remote_code=config.model.trust_remote_code,
-    )
-    
-    if config.model.gradient_checkpointing:
-        base_model.gradient_checkpointing_enable()
-    
-    surrogate_model = None
-    if config.surrogate.enabled:
-        logger.info(f"Loading surrogate model: {config.surrogate.name_or_path}")
-        surrogate_model = AutoModelForCausalLM.from_pretrained(
-            config.surrogate.name_or_path,
-            torch_dtype=config.surrogate.get_torch_dtype(),
-            trust_remote_code=config.surrogate.trust_remote_code,
+    # Check if TPU multi-core training
+    if config.training.device == "tpu" and config.training.tpu_cores > 1:
+        if not HAS_XLA:
+            raise RuntimeError("PyTorch XLA required for TPU training. Install with: pip install torch-xla")
+        
+        logger.info(f"Starting TPU multi-core training with {config.training.tpu_cores} cores")
+        
+        # Use xmp.spawn for multi-core TPU training
+        xmp.spawn(
+            _train_fn,
+            args=(config, base_tokenizer, surrogate_tokenizer, train_dataset, eval_dataset),
+            nprocs=config.training.tpu_cores,
+            start_method='fork',
         )
-        surrogate_model.eval()
-        for param in surrogate_model.parameters():
-            param.requires_grad = False
-    
-    # Initialize trainer
-    trainer = SurrogateTrainer(
-        config=config,
-        model=base_model,
-        tokenizer=base_tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        surrogate_model=surrogate_model,
-        surrogate_tokenizer=surrogate_tokenizer,
-    )
-    
-    try:
-        trainer.train()
-    finally:
-        trainer.close()
+    else:
+        # Single device training (GPU, single TPU core, MPS, or CPU)
+        logger.info(f"Loading base model: {config.model.name_or_path}")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            config.model.name_or_path,
+            torch_dtype=config.model.get_torch_dtype(),
+            trust_remote_code=config.model.trust_remote_code,
+        )
+        
+        if config.model.gradient_checkpointing:
+            base_model.gradient_checkpointing_enable()
+        
+        surrogate_model = None
+        if config.surrogate.enabled:
+            logger.info(f"Loading surrogate model: {config.surrogate.name_or_path}")
+            surrogate_model = AutoModelForCausalLM.from_pretrained(
+                config.surrogate.name_or_path,
+                torch_dtype=config.surrogate.get_torch_dtype(),
+                trust_remote_code=config.surrogate.trust_remote_code,
+            )
+            surrogate_model.eval()
+            for param in surrogate_model.parameters():
+                param.requires_grad = False
+        
+        # Initialize trainer
+        trainer = SurrogateTrainer(
+            config=config,
+            model=base_model,
+            tokenizer=base_tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            surrogate_model=surrogate_model,
+            surrogate_tokenizer=surrogate_tokenizer,
+        )
+        
+        try:
+            trainer.train()
+        finally:
+            trainer.close()
 
 
 if __name__ == "__main__":
