@@ -24,7 +24,7 @@ This implementation is based on a training approach where:
 
 ```bash
 # Clone or download this repository
-cd surrogate_lm_trainer
+cd sdce
 
 # Install dependencies
 pip install -r requirements.txt
