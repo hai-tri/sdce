@@ -3,6 +3,7 @@ torch>=2.0.0
 transformers>=4.35.0
 datasets>=2.14.0
 tokenizers>=0.14.0
+hf_xet>=1.0.0
 
 # Configuration
 pyyaml>=6.0
