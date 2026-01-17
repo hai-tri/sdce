@@ -1,6 +1,7 @@
-# Surrogate-Assisted Language Model Training
+# Multi-Label LLM Pretraining With A Smaller “Teacher” Model
 
-A generalized training framework for language models with surrogate model guidance. The surrogate model provides token-level perplexity signals that guide the primary model's learning process.
+
+Standard causal language model pretraining uses a single-label cross-entropy objective that ignores the existence of multiple valid next-token continuations, resulting in sample inefficiency. In this work, we introduce a multi-label pretraining objective that modifies the loss to append a small set of context-conforming auxiliary tokens selected by a lightweight surrogate language model. Distinct from existing knowledge distillation methods, the surrogate is used only for token selection rather than full distribution matching. We leveraged allenai.org’s OLMo 2 1B training repository, and we found that this method achieves comparable benchmark performance with significantly fewer training tokens and optimization steps. The results demonstrate that fixing this token-level label inefficiency can effectively lessen training times and has real-world applications towards nontrivial cost savings.
 
 ## Overview
 
