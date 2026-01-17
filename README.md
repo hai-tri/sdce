@@ -261,18 +261,4 @@ python train.py --config config.yaml --resume_from_checkpoint ./outputs/checkpoi
 - Try adjusting `k` parameter
 - Check learning rate and warmup settings
 
-## Citation
 
-If you use this code in your research, please cite:
-
-```bibtex
-@software{surrogate_lm_trainer,
-  title = {Surrogate-Assisted Language Model Training},
-  year = {2024},
-  url = {https://github.com/your-repo/surrogate-lm-trainer}
-}
-```
-
-## License
-
-MIT License
