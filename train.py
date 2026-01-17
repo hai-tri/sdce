@@ -42,8 +42,7 @@ from tqdm import tqdm
 
 # Optional: CUDA AMP
 try:
-    from torch.amp import autocast
-    from torch.cuda.amp import GradScaler
+    from torch.amp import autocast, GradScaler
     HAS_CUDA_AMP = True
 except ImportError:
     try:
@@ -437,10 +436,11 @@ def surrogate_cross_entropy_loss(
         valid_translation_mask = (translated_perp_indices >= 0) & (translated_perp_indices < vocab_size)
         safe_translated_indices = translated_perp_indices.clamp(0, vocab_size - 1)
         
-        # Gather logits for the selected tokens
-        gathered_logits = torch.gather(logits, dim=2, index=safe_translated_indices)
-        gathered_logit_probs = F.softmax(gathered_logits, dim=-1)
-        gathered_nll = -torch.log(gathered_logit_probs + 1e-10)
+        # Compute log probabilities over the FULL vocabulary first, then gather
+        # This is the correct way - we need the actual model probabilities
+        log_probs = F.log_softmax(logits, dim=-1)
+        gathered_log_probs = torch.gather(log_probs, dim=2, index=safe_translated_indices)
+        gathered_nll = -gathered_log_probs  # Negative log likelihood
         
         # Combine validity masks:
         # 1. perp_values not inf (token was above threshold)
@@ -449,9 +449,6 @@ def surrogate_cross_entropy_loss(
         token_valid_mask = ~torch.isinf(perp_values)
         combined_mask = token_valid_mask & valid_indices_mask & valid_translation_mask
         
-        # Mask out invalid entries for entire rows (where all entries are invalid)
-        row_valid_mask = combined_mask.any(dim=-1)  # (batch, seq)
-        
         # Count valid entries for normalization
         num_valid_surrogate_entries = combined_mask.sum().item()
         
@@ -459,11 +456,22 @@ def surrogate_cross_entropy_loss(
         # Mask invalid entries before softmax
         masked_perp_values = perp_values.clone()
         masked_perp_values[~combined_mask] = float('inf')
+        
+        # Handle edge case: if all values in a row are inf, softmax will produce NaN
+        # Replace rows where all values are inf with zeros (no surrogate contribution)
+        row_all_inf = torch.isinf(masked_perp_values).all(dim=-1, keepdim=True)
+        masked_perp_values = masked_perp_values.masked_fill(row_all_inf.expand_as(masked_perp_values), 0.0)
+        
         softmax_weights = F.softmax(-masked_perp_values, dim=-1)
         softmax_weights = softmax_weights * combined_mask.float()
         
+        # Zero out NaN weights (safety check)
+        softmax_weights = torch.nan_to_num(softmax_weights, nan=0.0)
+        
         # Weighted surrogate loss (scaled by surrogate_weight)
-        weighted_nll = gathered_nll * softmax_weights
+        # Also zero out NaN in gathered_nll (from invalid indices)
+        gathered_nll_safe = torch.nan_to_num(gathered_nll, nan=0.0, posinf=0.0, neginf=0.0)
+        weighted_nll = gathered_nll_safe * softmax_weights
         surrogate_loss = surrogate_weight * weighted_nll.sum()
         
         # Standard cross-entropy loss
@@ -1093,18 +1101,40 @@ class SurrogateTrainer:
         # CUDA mixed precision
         if self.device.type == "cuda":
             if self.config.training.mixed_precision == "fp16" and HAS_CUDA_AMP:
+                # Only use GradScaler for fp16 on CUDA
+                # GradScaler auto-detects the device
                 self.scaler = GradScaler()
                 self.autocast_dtype = torch.float16
                 self.use_autocast = True
+                logger.info("CUDA: Using fp16 mixed precision with GradScaler")
+            elif self.config.training.mixed_precision == "bf16":
+                # bfloat16 doesn't need GradScaler (no loss scaling needed)
+                self.autocast_dtype = torch.bfloat16
+                self.use_autocast = True
+                logger.info("CUDA: Using bf16 mixed precision (no GradScaler)")
+            else:
+                logger.info("CUDA: Using float32 precision")
+        
+        # MPS mixed precision (limited support, no GradScaler)
+        elif self.device.type == "mps":
+            if self.config.training.mixed_precision == "fp16":
+                # MPS supports fp16 autocast but not GradScaler
+                self.autocast_dtype = torch.float16
+                self.use_autocast = True
+                logger.info("MPS: Using fp16 autocast (no GradScaler)")
             elif self.config.training.mixed_precision == "bf16":
                 self.autocast_dtype = torch.bfloat16
                 self.use_autocast = True
+                logger.info("MPS: Using bf16 autocast (no GradScaler)")
+            else:
+                logger.info("MPS: Using float32 precision")
         
-        # MPS mixed precision (limited support)
-        elif self.device.type == "mps":
-            if self.config.training.mixed_precision == "fp16":
-                self.autocast_dtype = torch.float16
-                self.use_autocast = True
+        # CPU - no mixed precision benefits
+        elif self.device.type == "cpu":
+            if self.config.training.mixed_precision not in ("no", "fp32", None):
+                logger.warning("CPU: Mixed precision has limited benefit, using float32")
+            self.use_autocast = False
+            self.autocast_dtype = torch.float32
     
     def _setup_logging(self) -> None:
         """Setup logging with Weights & Biases."""
@@ -2036,10 +2066,21 @@ def main():
         )
     else:
         # Single device training (GPU, single TPU core, MPS, or CPU)
+        
+        # Determine the dtype for the base model
+        # When using fp16 mixed precision on CUDA with GradScaler, model weights must be FP32
+        # GradScaler handles the FP16 computation via autocast, but gradients must be FP32
+        base_model_dtype = config.model.get_torch_dtype()
+        if (config.training.device in ["auto", "cuda"] and 
+            torch.cuda.is_available() and 
+            config.training.mixed_precision == "fp16"):
+            base_model_dtype = torch.float32
+            logger.info("Using FP32 for base model weights (fp16 mixed precision via autocast + GradScaler)")
+        
         logger.info(f"Loading base model: {config.model.name_or_path}")
         base_model = AutoModelForCausalLM.from_pretrained(
             config.model.name_or_path,
-            torch_dtype=config.model.get_torch_dtype(),
+            torch_dtype=base_model_dtype,
             trust_remote_code=config.model.trust_remote_code,
         )
         
@@ -2048,6 +2089,7 @@ def main():
         
         surrogate_model = None
         if config.surrogate.enabled:
+            # Surrogate model can stay in FP16 since it's inference-only (no gradients)
             logger.info(f"Loading surrogate model: {config.surrogate.name_or_path}")
             surrogate_model = AutoModelForCausalLM.from_pretrained(
                 config.surrogate.name_or_path,
