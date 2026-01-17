@@ -95,12 +95,10 @@ def cross_entropy_loss(
         # Clamp to valid range for gather operation (will be masked out anyway)
         safe_translated_indices = translated_perp_indices.clamp(0, vocab_size - 1)
         
-        # Gather logits for the translated tokens
-        # gathered_logits: (batch_size, seq_len, max_tokens)
-        gathered_logits = torch.gather(logits, dim=2, index=safe_translated_indices)
-        
-        # Compute log probabilities for gathered tokens
-        gathered_log_probs = F.log_softmax(gathered_logits, dim=-1)
+        # Compute log probabilities over the FULL vocabulary first, then gather
+        # This is the correct way - we need the actual model probabilities
+        log_probs = F.log_softmax(logits, dim=-1)
+        gathered_log_probs = torch.gather(log_probs, dim=2, index=safe_translated_indices)
         gathered_nll = -gathered_log_probs  # Negative log likelihood
         
         # Identify rows where all perplexity values are inf (invalid positions)
@@ -125,14 +123,24 @@ def cross_entropy_loss(
         masked_perp = perp_values.clone()
         masked_perp[~combined_mask] = float('inf')
         
+        # Handle edge case: if all values in a row are inf, softmax will produce NaN
+        # Replace rows where all values are inf with zeros (no surrogate contribution)
+        row_all_inf = torch.isinf(masked_perp).all(dim=-1, keepdim=True)
+        masked_perp = masked_perp.masked_fill(row_all_inf.expand_as(masked_perp), 0.0)
+        
         # Softmax over the token dimension (the selected tokens)
         softmax_weights = F.softmax(-masked_perp, dim=-1)
         
         # Zero out invalid positions
         softmax_weights = softmax_weights * combined_mask.float()
         
+        # Zero out NaN weights (safety check)
+        softmax_weights = torch.nan_to_num(softmax_weights, nan=0.0)
+        
         # Compute weighted surrogate loss (scaled by surrogate_weight)
-        weighted_nll = gathered_nll * softmax_weights
+        # Also zero out NaN in gathered_nll (from invalid indices)
+        gathered_nll_safe = torch.nan_to_num(gathered_nll, nan=0.0, posinf=0.0, neginf=0.0)
+        weighted_nll = gathered_nll_safe * softmax_weights
         surrogate_loss_sum = surrogate_weight * weighted_nll.sum()
         
         # Compute standard cross-entropy loss
