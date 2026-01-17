@@ -71,63 +71,6 @@ python train.py --config config.yaml
 python train.py --config config.yaml --learning_rate 5e-5 --batch_size 8
 ```
 
-## Configuration
-
-### Full Configuration Reference
-
-```yaml
-# Base model configuration
-model:
-  name_or_path: "gpt2"              # Model name or path
-  dtype: "float16"                   # float16, bfloat16, float32
-  use_flash_attention: false         # Enable flash attention
-  gradient_checkpointing: false      # Enable gradient checkpointing
-  trust_remote_code: false           # Trust remote code for custom models
-
-# Surrogate model configuration
-surrogate:
-  name_or_path: "Qwen/Qwen3-0.6B"   # Surrogate model
-  dtype: "float16"                   # Data type for surrogate
-  k: 6                               # Top-k tokens to consider
-  enabled: true                      # Enable/disable surrogate
-  trust_remote_code: true            # Trust remote code
-
-# Data configuration
-data:
-  dataset_name: "wikitext"           # HuggingFace dataset
-  dataset_config: "wikitext-2-raw-v1"
-  dataset_split: "train"
-  eval_split: "validation"
-  text_column: "text"
-  max_seq_length: 1024
-  preprocessing_num_workers: 4
-  train_file: null                   # For custom datasets
-  eval_file: null
-
-# Training configuration
-training:
-  output_dir: "./outputs"
-  num_epochs: 3
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 4
-  learning_rate: 1.0e-4
-  weight_decay: 0.01
-  warmup_ratio: 0.1
-  max_grad_norm: 1.0
-  lr_scheduler_type: "cosine"
-  mixed_precision: "fp16"
-  logging_steps: 10
-  eval_steps: 500
-  save_steps: 1000
-  save_total_limit: 3
-  use_z_loss: false
-  z_loss_multiplier: 1.0e-4
-  seed: 42
-  wandb_project: null
-  wandb_run_name: null
-```
-
 ## Training Approaches
 
 ### 1. Standard Training (No Surrogate)
