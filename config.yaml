@@ -111,7 +111,6 @@ evaluation:
     - 'bbh'
     - 'agieval'
     - 'openbookqa'
-    - 'math'
     
   num_fewshot: 0                   # Number of few-shot examples (0 for zero-shot)
   batch_size: 8                    # Batch size for evaluation
