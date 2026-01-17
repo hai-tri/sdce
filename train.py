@@ -1391,6 +1391,20 @@ class SurrogateTrainer:
         if z_loss is not None:
             metrics["z_loss"] = z_loss.item()
         
+        # Track number of auxiliary tokens selected by surrogate
+        if perp_indices is not None and perp_values is not None:
+            # Count valid tokens (not -1 index and not inf perplexity)
+            valid_mask = (perp_indices >= 0) & (~torch.isinf(perp_values))
+            num_aux_tokens = valid_mask.sum().item()
+            # Also compute average per position (for positions that have at least one token)
+            num_positions = perp_indices.shape[0] * perp_indices.shape[1]
+            positions_with_tokens = valid_mask.any(dim=-1).sum().item()
+            
+            metrics["aux_tokens_total"] = num_aux_tokens
+            metrics["aux_tokens_per_position"] = num_aux_tokens / (num_positions + 1e-8)
+            metrics["positions_with_aux_tokens"] = positions_with_tokens
+            metrics["positions_with_aux_tokens_pct"] = 100.0 * positions_with_tokens / (num_positions + 1e-8)
+        
         return metrics
     
     def optimizer_step(self) -> Dict[str, float]:
@@ -1685,6 +1699,9 @@ class SurrogateTrainer:
         running_loss = 0.0
         running_grad_norm = 0.0
         running_steps = 0
+        running_aux_tokens = 0.0
+        running_aux_positions = 0.0
+        running_aux_positions_pct = 0.0
         
         # Compute batch tokens
         batch_tokens = (
@@ -1710,6 +1727,12 @@ class SurrogateTrainer:
                 metrics = self.train_step(batch)
                 running_loss += metrics["loss"]
                 running_steps += 1
+                
+                # Accumulate auxiliary token metrics
+                if "aux_tokens_per_position" in metrics:
+                    running_aux_tokens += metrics["aux_tokens_per_position"]
+                    running_aux_positions += metrics["positions_with_aux_tokens"]
+                    running_aux_positions_pct += metrics["positions_with_aux_tokens_pct"]
                 
                 # Update speed metrics
                 self.speed_metrics.update(batch_tokens)
@@ -1740,6 +1763,10 @@ class SurrogateTrainer:
                             "train/learning_rate": optim_metrics["learning_rate"],
                             "train/grad_norm": avg_grad_norm,
                             "train/surrogate_weight": metrics.get("surrogate_weight", 0.0),
+                            
+                            # Surrogate/auxiliary token metrics
+                            "surrogate/aux_tokens_per_position": running_aux_tokens / (running_steps + 1e-8),
+                            "surrogate/positions_with_aux_tokens_pct": running_aux_positions_pct / (running_steps + 1e-8),
                             
                             # Throughput metrics
                             "throughput/tokens_per_second": speed["tokens_per_second_global"],
@@ -1772,6 +1799,9 @@ class SurrogateTrainer:
                         running_loss = 0.0
                         running_grad_norm = 0.0
                         running_steps = 0
+                        running_aux_tokens = 0.0
+                        running_aux_positions = 0.0
+                        running_aux_positions_pct = 0.0
                         self.speed_metrics.reset()
                     
                     # Evaluation (loss-based)
