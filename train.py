@@ -1539,72 +1539,93 @@ class SurrogateTrainer:
         logger.info(f"Running benchmarks: {self.config.evaluation.tasks}")
         
         self.model.eval()
+        benchmark_metrics = {}
         
-        try:
-            # Get the underlying model (unwrap DDP if necessary)
-            model_to_eval = self.model.module if hasattr(self.model, "module") else self.model
-            
-            # Create lm-eval model wrapper
-            lm_model = HFLM(
-                pretrained=model_to_eval,
-                tokenizer=self.tokenizer,
-                batch_size=self.config.evaluation.batch_size,
-                device=str(self.device),
-            )
-            
-            # Run evaluation
-            results = simple_evaluate(
-                model=lm_model,
-                tasks=self.config.evaluation.tasks,
-                num_fewshot=self.config.evaluation.num_fewshot,
-                limit=self.config.evaluation.limit,
-                log_samples=False,
-            )
-            
-            # Extract metrics
-            benchmark_metrics = {}
-            task_scores = []
-            
-            for task_name, task_results in results.get("results", {}).items():
-                # Get the main accuracy/score metric
-                if "acc" in task_results:
-                    score = task_results["acc"]
-                    metric_name = "acc"
-                elif "acc_norm" in task_results:
-                    score = task_results["acc_norm"]
-                    metric_name = "acc_norm"
-                elif "exact_match" in task_results:
-                    score = task_results["exact_match"]
-                    metric_name = "exact_match"
-                else:
-                    # Take first numeric metric
-                    for k, v in task_results.items():
-                        if isinstance(v, (int, float)) and not k.endswith("_stderr"):
-                            score = v
-                            metric_name = k
-                            break
-                    else:
+        # Get the underlying model (unwrap DDP if necessary)
+        model_to_eval = self.model.module if hasattr(self.model, "module") else self.model
+        
+        # Try to run each task individually to handle partial failures
+        task_scores = []
+        failed_tasks = []
+        
+        for task in self.config.evaluation.tasks:
+            try:
+                logger.info(f"Running benchmark task: {task}")
+                
+                # Create lm-eval model wrapper (recreate for each task to avoid state issues)
+                lm_model = HFLM(
+                    pretrained=model_to_eval,
+                    tokenizer=self.tokenizer,
+                    batch_size=self.config.evaluation.batch_size,
+                    device=str(self.device),
+                )
+                
+                results = simple_evaluate(
+                    model=lm_model,
+                    tasks=[task],
+                    num_fewshot=self.config.evaluation.num_fewshot,
+                    limit=self.config.evaluation.limit,
+                    log_samples=False,
+                )
+                
+                # Handle both old and new lm-eval result formats
+                results_dict = results.get("results", results)
+                
+                for task_name, task_results in results_dict.items():
+                    # Skip non-dict entries
+                    if not isinstance(task_results, dict):
                         continue
-                
-                task_scores.append(score)
-                
-                if self.config.evaluation.log_individual_tasks:
-                    benchmark_metrics[f"benchmark/{task_name}/{metric_name}"] = score
                     
-                    # Also log stderr if available
-                    stderr_key = f"{metric_name}_stderr"
-                    if stderr_key in task_results:
-                        benchmark_metrics[f"benchmark/{task_name}/{stderr_key}"] = task_results[stderr_key]
+                    # Try to find the main metric
+                    score = None
+                    metric_name = None
+                    
+                    # Priority order for metrics
+                    metric_priority = ["acc_norm,none", "acc,none", "acc_norm", "acc", "exact_match,none", "exact_match"]
+                    
+                    for metric in metric_priority:
+                        if metric in task_results:
+                            score = task_results[metric]
+                            metric_name = metric.replace(",none", "")
+                            break
+                    
+                    # Fallback: take first numeric metric that's not stderr
+                    if score is None:
+                        for k, v in task_results.items():
+                            if isinstance(v, (int, float)) and not k.endswith("_stderr") and not k.endswith(",stderr"):
+                                score = v
+                                metric_name = k.replace(",none", "")
+                                break
+                    
+                    if score is not None and metric_name is not None:
+                        task_scores.append(score)
+                        
+                        if self.config.evaluation.log_individual_tasks:
+                            clean_metric = metric_name.replace(",", "_")
+                            benchmark_metrics[f"benchmark/{task_name}/{clean_metric}"] = score
+                            logger.info(f"  {task_name}/{clean_metric}: {score:.4f}")
+                            
+                            # Also log stderr if available
+                            stderr_keys = [f"{metric_name}_stderr", f"{metric_name},stderr"]
+                            for stderr_key in stderr_keys:
+                                if stderr_key in task_results:
+                                    benchmark_metrics[f"benchmark/{task_name}/{clean_metric}_stderr"] = task_results[stderr_key]
+                                    break
             
-            # Compute aggregate score
-            if self.config.evaluation.log_aggregate_score and task_scores:
-                benchmark_metrics["benchmark/average_score"] = sum(task_scores) / len(task_scores)
-            
-            logger.info(f"Benchmark results: {benchmark_metrics}")
-            
-        except Exception as e:
-            logger.error(f"Error running benchmarks: {e}")
-            benchmark_metrics = {}
+            except Exception as task_error:
+                logger.warning(f"Failed to run benchmark task '{task}': {task_error}")
+                failed_tasks.append(task)
+                continue
+        
+        # Compute aggregate score
+        if self.config.evaluation.log_aggregate_score and task_scores:
+            benchmark_metrics["benchmark/average_score"] = sum(task_scores) / len(task_scores)
+        
+        # Print failed tasks (not logged to wandb)
+        if failed_tasks:
+            print(f"BENCHMARK TASKS FAILED: {failed_tasks}")
+        
+        logger.info(f"Benchmark results: {benchmark_metrics}")
         
         self.model.train()
         
@@ -1821,8 +1842,11 @@ class SurrogateTrainer:
                                 self.save_checkpoint(best_path)
                     
                     # Benchmark evaluation (lm-eval-harness)
+                    # Skip step 0 to avoid running before any training
                     if (self.config.evaluation.enabled and 
+                        self.global_step > 0 and
                         self.global_step % self.config.evaluation.eval_interval == 0):
+                        logger.info(f"Step {self.global_step}: Starting benchmark evaluation...")
                         benchmark_metrics = self.run_benchmarks()
                         
                         if benchmark_metrics and self.global_rank == 0:
@@ -1830,6 +1854,8 @@ class SurrogateTrainer:
                             
                             if HAS_WANDB and wandb.run is not None:
                                 wandb.log(benchmark_metrics, step=self.global_step)
+                        elif self.global_rank == 0:
+                            logger.warning(f"Step {self.global_step}: No benchmark metrics returned")
                     
                     # Save checkpoint
                     if self.global_step % self.config.training.save_steps == 0:
