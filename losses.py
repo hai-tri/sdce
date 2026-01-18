@@ -1,8 +1,8 @@
 """
-Custom Cross-Entropy Loss with Surrogate Guidance
+Custom Cross-Entropy Loss with Surrogate Guidance and Knowledge Distillation
 
 This module provides loss functions for language model training with optional
-surrogate model guidance.
+surrogate model guidance or standard knowledge distillation.
 """
 
 import torch
@@ -208,6 +208,150 @@ def cross_entropy_loss(
     return loss, z_loss
 
 
+def knowledge_distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 4.0,
+    alpha: float = 0.5,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+    compute_z_loss: bool = False,
+    z_loss_multiplier: float = 1e-4,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict]:
+    """
+    Standard Knowledge Distillation loss (Hinton et al., 2015).
+    
+    Combines soft target loss (KL divergence between teacher and student distributions)
+    with hard target loss (cross-entropy with ground truth labels).
+    
+    L_KD = alpha * T^2 * KL(softmax(z_t/T) || softmax(z_s/T)) + (1-alpha) * L_CE
+    
+    Args:
+        student_logits: Student model logits. Shape: (batch_size, seq_len, vocab_size) or
+            (batch_size * seq_len, vocab_size)
+        teacher_logits: Teacher model logits. Shape must match student_logits.
+        labels: Ground truth labels. Shape: (batch_size, seq_len) or (batch_size * seq_len,)
+        temperature: Temperature for softening distributions. Higher = softer.
+            Typical values: 2-20. Default: 4.0
+        alpha: Weight for distillation loss vs. hard label loss.
+            alpha=1.0 means only distillation, alpha=0.0 means only CE.
+            Default: 0.5
+        ignore_index: Index to ignore in loss computation (typically -100 for padding)
+        reduction: How to reduce the loss - "mean", "sum", or "none"
+        compute_z_loss: Whether to compute auxiliary z-loss (from PaLM paper)
+        z_loss_multiplier: Coefficient for z-loss term
+        
+    Returns:
+        Tuple of (total_loss, z_loss, metrics_dict) where:
+        - total_loss: Combined KD loss
+        - z_loss: Optional z-loss (None if compute_z_loss=False)
+        - metrics_dict: Dictionary with 'kd_loss' and 'ce_loss' for logging
+        
+    Example:
+        >>> loss, z_loss, metrics = knowledge_distillation_loss(
+        ...     student_logits=student_out.logits,
+        ...     teacher_logits=teacher_out.logits,
+        ...     labels=labels,
+        ...     temperature=4.0,
+        ...     alpha=0.5
+        ... )
+    """
+    device = student_logits.device
+    
+    # Ensure consistent shapes
+    if student_logits.dim() == 3:
+        batch_size, seq_len, vocab_size = student_logits.shape
+        student_logits_flat = student_logits.view(-1, vocab_size)
+        teacher_logits_flat = teacher_logits.view(-1, vocab_size)
+        labels_flat = labels.view(-1)
+    else:
+        student_logits_flat = student_logits
+        teacher_logits_flat = teacher_logits
+        labels_flat = labels
+        vocab_size = student_logits.shape[-1]
+    
+    # Create mask for valid positions (not padding)
+    valid_mask = (labels_flat != ignore_index)
+    num_valid = valid_mask.sum().item()
+    
+    if num_valid == 0:
+        # No valid tokens, return zero loss
+        zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        return zero_loss, None, {'kd_loss': 0.0, 'ce_loss': 0.0}
+    
+    # =========================================================================
+    # Soft target loss (KL Divergence)
+    # =========================================================================
+    # Soften distributions with temperature
+    student_soft = F.log_softmax(student_logits_flat / temperature, dim=-1)
+    teacher_soft = F.softmax(teacher_logits_flat / temperature, dim=-1)
+    
+    # KL divergence: sum over vocab, then handle reduction
+    # KL(P || Q) = sum(P * (log(P) - log(Q)))
+    # Using F.kl_div with log_target=False: expects input=log(Q), target=P
+    kl_div_per_token = F.kl_div(
+        student_soft,
+        teacher_soft,
+        reduction='none',
+        log_target=False
+    ).sum(dim=-1)  # Sum over vocabulary
+    
+    # Mask out padding positions
+    kl_div_per_token = kl_div_per_token * valid_mask.float()
+    
+    # Scale by T^2 as per Hinton et al.
+    kl_div_scaled = kl_div_per_token * (temperature ** 2)
+    
+    # =========================================================================
+    # Hard target loss (Cross-Entropy)
+    # =========================================================================
+    ce_loss_per_token = F.cross_entropy(
+        student_logits_flat,
+        labels_flat,
+        ignore_index=ignore_index,
+        reduction='none'
+    )
+    
+    # =========================================================================
+    # Combine losses
+    # =========================================================================
+    if reduction == "mean":
+        kd_loss = kl_div_scaled.sum() / (num_valid + 1e-8)
+        ce_loss = ce_loss_per_token.sum() / (num_valid + 1e-8)
+        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
+    elif reduction == "sum":
+        kd_loss = kl_div_scaled.sum()
+        ce_loss = ce_loss_per_token.sum()
+        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
+    else:  # reduction == "none"
+        kd_loss = kl_div_scaled
+        ce_loss = ce_loss_per_token
+        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
+    
+    # =========================================================================
+    # Optional Z-loss computation (from PaLM paper)
+    # =========================================================================
+    z_loss = None
+    if compute_z_loss:
+        z_squared = student_logits_flat.logsumexp(dim=-1).pow(2)
+        
+        if reduction == "mean":
+            z_loss = z_loss_multiplier * (z_squared * valid_mask.float()).sum() / (num_valid + 1e-8)
+        elif reduction == "sum":
+            z_loss = z_loss_multiplier * (z_squared * valid_mask.float()).sum()
+        else:
+            z_loss = z_loss_multiplier * z_squared
+    
+    # Metrics for logging
+    metrics = {
+        'kd_loss': kd_loss.item() if reduction != "none" else kd_loss.mean().item(),
+        'ce_loss': ce_loss.item() if reduction != "none" else ce_loss.mean().item(),
+    }
+    
+    return total_loss, z_loss, metrics
+
+
 def compute_perplexity_guidance(
     surrogate_logits: torch.Tensor,
     labels: torch.Tensor,
@@ -343,6 +487,66 @@ class SurrogateCrossEntropyLoss(torch.nn.Module):
             perp_indices=perp_indices,
             lookup_surrogate_to_self_tokens=self.lookup_table,
             surrogate_weight=surrogate_weight,
+            ignore_index=self.ignore_index,
+            reduction=self.reduction,
+            compute_z_loss=self.compute_z_loss,
+            z_loss_multiplier=self.z_loss_multiplier,
+        )
+
+
+class KnowledgeDistillationLoss(torch.nn.Module):
+    """
+    PyTorch module wrapper for knowledge distillation loss.
+    
+    Example:
+        >>> criterion = KnowledgeDistillationLoss(
+        ...     temperature=4.0,
+        ...     alpha=0.5,
+        ...     compute_z_loss=True
+        ... )
+        >>> loss, z_loss, metrics = criterion(student_logits, teacher_logits, labels)
+    """
+    
+    def __init__(
+        self,
+        temperature: float = 4.0,
+        alpha: float = 0.5,
+        ignore_index: int = -100,
+        reduction: str = "mean",
+        compute_z_loss: bool = False,
+        z_loss_multiplier: float = 1e-4,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.alpha = alpha
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.compute_z_loss = compute_z_loss
+        self.z_loss_multiplier = z_loss_multiplier
+    
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: torch.Tensor,
+        alpha: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict]:
+        """
+        Args:
+            student_logits: Student model logits
+            teacher_logits: Teacher model logits
+            labels: Ground truth labels
+            alpha: Override alpha value (for scheduled alpha)
+            
+        Returns:
+            Tuple of (loss, z_loss, metrics_dict)
+        """
+        return knowledge_distillation_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            labels=labels,
+            temperature=self.temperature,
+            alpha=alpha if alpha is not None else self.alpha,
             ignore_index=self.ignore_index,
             reduction=self.reduction,
             compute_z_loss=self.compute_z_loss,
