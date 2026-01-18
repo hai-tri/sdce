@@ -249,6 +249,25 @@ class EvaluationConfig:
 
 
 @dataclass
+class DistillationConfig:
+    """Configuration for distillation mode."""
+    # Distillation mode: "surrogate" (SDCE), "kd" (standard KD), or "none"
+    mode: str = "surrogate"
+    
+    # Knowledge Distillation (KD) specific parameters
+    # Only used when mode="kd"
+    kd_temperature: float = 4.0   # Temperature for softening distributions (typical: 2-20)
+    kd_alpha: float = 0.5         # Weight for KD loss vs CE loss
+                                   # alpha=1.0: only distillation loss
+                                   # alpha=0.0: only cross-entropy loss
+    
+    # Alpha scheduling (optional)
+    kd_alpha_schedule: bool = False  # Enable alpha scheduling
+    kd_alpha_initial: float = 0.9    # Initial alpha value
+    kd_alpha_final: float = 0.1      # Final alpha value
+
+
+@dataclass
 class Config:
     """Main configuration combining all sub-configs."""
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -256,6 +275,7 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    distillation: DistillationConfig = field(default_factory=DistillationConfig)
     
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
@@ -272,6 +292,7 @@ class Config:
             data=DataConfig(**raw_config.get("data", {})),
             training=TrainingConfig(**raw_config.get("training", {})),
             evaluation=EvaluationConfig(**raw_config.get("evaluation", {})),
+            distillation=DistillationConfig(**raw_config.get("distillation", {})),
         )
     
     @classmethod
@@ -356,6 +377,20 @@ class Config:
             config.training.device = args.device
         if hasattr(args, 'tpu_cores') and args.tpu_cores:
             config.training.tpu_cores = args.tpu_cores
+        
+        # Distillation config
+        if hasattr(args, 'distillation_mode') and args.distillation_mode:
+            config.distillation.mode = args.distillation_mode
+        if hasattr(args, 'kd_temperature') and args.kd_temperature is not None:
+            config.distillation.kd_temperature = args.kd_temperature
+        if hasattr(args, 'kd_alpha') and args.kd_alpha is not None:
+            config.distillation.kd_alpha = args.kd_alpha
+        if hasattr(args, 'kd_alpha_schedule') and args.kd_alpha_schedule:
+            config.distillation.kd_alpha_schedule = True
+        if hasattr(args, 'kd_alpha_initial') and args.kd_alpha_initial is not None:
+            config.distillation.kd_alpha_initial = args.kd_alpha_initial
+        if hasattr(args, 'kd_alpha_final') and args.kd_alpha_final is not None:
+            config.distillation.kd_alpha_final = args.kd_alpha_final
             
         return config
     
@@ -367,6 +402,7 @@ class Config:
             "data": vars(self.data),
             "training": vars(self.training),
             "evaluation": vars(self.evaluation),
+            "distillation": vars(self.distillation),
         }
         with open(path, "w") as f:
             json.dump(config_dict, f, indent=2)
@@ -523,6 +559,140 @@ def surrogate_cross_entropy_loss(
             z_loss = z_loss_multiplier * z_squared
     
     return loss, z_loss
+
+
+def knowledge_distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 4.0,
+    alpha: float = 0.5,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+    compute_z_loss: bool = False,
+    z_loss_multiplier: float = 1e-4,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict]:
+    """
+    Standard Knowledge Distillation loss (Hinton et al., 2015).
+    
+    Combines soft target loss (KL divergence between teacher and student distributions)
+    with hard target loss (cross-entropy with ground truth labels).
+    
+    L_KD = alpha * T^2 * KL(softmax(z_t/T) || softmax(z_s/T)) + (1-alpha) * L_CE
+    
+    Args:
+        student_logits: Student model logits. Shape: (batch_size, seq_len, vocab_size) or
+            (batch_size * seq_len, vocab_size)
+        teacher_logits: Teacher model logits. Shape must match student_logits.
+        labels: Ground truth labels. Shape: (batch_size, seq_len) or (batch_size * seq_len,)
+        temperature: Temperature for softening distributions. Higher = softer.
+            Typical values: 2-20. Default: 4.0
+        alpha: Weight for distillation loss vs. hard label loss.
+            alpha=1.0 means only distillation, alpha=0.0 means only CE.
+            Default: 0.5
+        ignore_index: Index to ignore in loss computation (typically -100 for padding)
+        reduction: How to reduce the loss - "mean", "sum", or "none"
+        compute_z_loss: Whether to compute auxiliary z-loss (from PaLM paper)
+        z_loss_multiplier: Coefficient for z-loss term
+        
+    Returns:
+        Tuple of (total_loss, z_loss, metrics_dict) where:
+        - total_loss: Combined KD loss
+        - z_loss: Optional z-loss (None if compute_z_loss=False)
+        - metrics_dict: Dictionary with 'kd_loss' and 'ce_loss' for logging
+    """
+    device = student_logits.device
+    
+    # Ensure consistent shapes
+    if student_logits.dim() == 3:
+        batch_size, seq_len, vocab_size = student_logits.shape
+        student_logits_flat = student_logits.view(-1, vocab_size)
+        teacher_logits_flat = teacher_logits.view(-1, vocab_size)
+        labels_flat = labels.view(-1)
+    else:
+        student_logits_flat = student_logits
+        teacher_logits_flat = teacher_logits
+        labels_flat = labels
+        vocab_size = student_logits.shape[-1]
+    
+    # Create mask for valid positions (not padding)
+    valid_mask = (labels_flat != ignore_index)
+    num_valid = valid_mask.sum().item()
+    
+    if num_valid == 0:
+        # No valid tokens, return zero loss
+        zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        return zero_loss, None, {'kd_loss': 0.0, 'ce_loss': 0.0}
+    
+    # =========================================================================
+    # Soft target loss (KL Divergence)
+    # =========================================================================
+    # Soften distributions with temperature
+    student_soft = F.log_softmax(student_logits_flat / temperature, dim=-1)
+    teacher_soft = F.softmax(teacher_logits_flat / temperature, dim=-1)
+    
+    # KL divergence: sum over vocab, then handle reduction
+    # Using F.kl_div with log_target=False: expects input=log(Q), target=P
+    kl_div_per_token = F.kl_div(
+        student_soft,
+        teacher_soft,
+        reduction='none',
+        log_target=False
+    ).sum(dim=-1)  # Sum over vocabulary
+    
+    # Mask out padding positions
+    kl_div_per_token = kl_div_per_token * valid_mask.float()
+    
+    # Scale by T^2 as per Hinton et al.
+    kl_div_scaled = kl_div_per_token * (temperature ** 2)
+    
+    # =========================================================================
+    # Hard target loss (Cross-Entropy)
+    # =========================================================================
+    ce_loss_per_token = F.cross_entropy(
+        student_logits_flat,
+        labels_flat,
+        ignore_index=ignore_index,
+        reduction='none'
+    )
+    
+    # =========================================================================
+    # Combine losses
+    # =========================================================================
+    if reduction == "mean":
+        kd_loss = kl_div_scaled.sum() / (num_valid + 1e-8)
+        ce_loss = ce_loss_per_token.sum() / (num_valid + 1e-8)
+        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
+    elif reduction == "sum":
+        kd_loss = kl_div_scaled.sum()
+        ce_loss = ce_loss_per_token.sum()
+        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
+    else:  # reduction == "none"
+        kd_loss = kl_div_scaled
+        ce_loss = ce_loss_per_token
+        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
+    
+    # =========================================================================
+    # Optional Z-loss computation (from PaLM paper)
+    # =========================================================================
+    z_loss = None
+    if compute_z_loss:
+        z_squared = student_logits_flat.logsumexp(dim=-1).pow(2)
+        
+        if reduction == "mean":
+            z_loss = z_loss_multiplier * (z_squared * valid_mask.float()).sum() / (num_valid + 1e-8)
+        elif reduction == "sum":
+            z_loss = z_loss_multiplier * (z_squared * valid_mask.float()).sum()
+        else:
+            z_loss = z_loss_multiplier * z_squared
+    
+    # Metrics for logging
+    metrics = {
+        'kd_loss': kd_loss.item() if reduction != "none" else kd_loss.mean().item(),
+        'ce_loss': ce_loss.item() if reduction != "none" else ce_loss.mean().item(),
+    }
+    
+    return total_loss, z_loss, metrics
 
 
 # =============================================================================
@@ -1192,6 +1362,114 @@ class SurrogateTrainer:
         weight = final + (initial - final) * cosine_decay
         return weight
     
+    def get_kd_alpha(self) -> float:
+        """
+        Compute the current KD alpha using optional cosine decay scheduling.
+        
+        If kd_alpha_schedule is enabled, alpha decays from kd_alpha_initial
+        to kd_alpha_final over training following a cosine schedule.
+        Otherwise, returns the fixed kd_alpha value.
+        
+        Returns:
+            Current KD alpha value
+        """
+        if not self.config.distillation.kd_alpha_schedule:
+            return self.config.distillation.kd_alpha
+        
+        initial = self.config.distillation.kd_alpha_initial
+        final = self.config.distillation.kd_alpha_final
+        
+        if self.total_training_steps == 0:
+            return initial
+        
+        # Cosine decay
+        progress = min(self.global_step / self.total_training_steps, 1.0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        alpha = final + (initial - final) * cosine_decay
+        return alpha
+    
+    def compute_teacher_logits(
+        self,
+        batch: Dict[str, torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """
+        Compute teacher (surrogate) model logits for knowledge distillation.
+        
+        For KD mode, we need the full teacher distribution, not just top-k tokens.
+        This handles vocabulary alignment between teacher and student.
+        
+        Returns:
+            Teacher logits aligned to student vocabulary, or None if teacher unavailable
+        """
+        if self.surrogate_model is None or not self.config.surrogate.enabled:
+            return None
+        
+        with torch.no_grad():
+            input_ids = batch["input_ids"]
+            attention_mask = batch.get("attention_mask")
+            batch_size, seq_len = input_ids.shape
+            
+            # Translate base model token IDs to surrogate token IDs
+            surrogate_input_ids = self.vocab_aligner.lookup_base_to_surrogate[input_ids]
+            
+            # Create mask for untranslatable tokens
+            untranslatable_mask = (surrogate_input_ids == -100)
+            
+            # Replace untranslatable tokens with surrogate's pad token
+            surrogate_pad_id = self.surrogate_tokenizer.pad_token_id
+            if surrogate_pad_id is None:
+                surrogate_pad_id = self.surrogate_tokenizer.eos_token_id
+            
+            surrogate_input_ids_safe = surrogate_input_ids.clone()
+            surrogate_input_ids_safe[untranslatable_mask] = surrogate_pad_id
+            
+            # Create attention mask for surrogate
+            if attention_mask is not None:
+                surrogate_attention_mask = attention_mask.clone()
+                surrogate_attention_mask[untranslatable_mask] = 0
+            else:
+                surrogate_attention_mask = (~untranslatable_mask).long()
+            
+            # Forward pass through surrogate model
+            surrogate_outputs = self.surrogate_model(
+                input_ids=surrogate_input_ids_safe,
+                attention_mask=surrogate_attention_mask,
+            )
+            
+            # Shift logits for next-token prediction alignment
+            surrogate_logits = surrogate_outputs.logits[..., :-1, :].contiguous()
+            # Shape: (batch_size, seq_len-1, surrogate_vocab_size)
+            
+            # Get vocabulary sizes
+            surrogate_vocab_size = surrogate_logits.shape[-1]
+            base_vocab_size = self.model.config.vocab_size if hasattr(self.model, 'config') else self.tokenizer.vocab_size
+            
+            # Create aligned teacher logits in student vocabulary space
+            # Initialize with very negative values (effectively zero probability after softmax)
+            aligned_logits = torch.full(
+                (batch_size, seq_len - 1, base_vocab_size),
+                fill_value=-1e9,
+                device=self.device,
+                dtype=surrogate_logits.dtype
+            )
+            
+            # Map surrogate logits to base vocabulary
+            # For each token in surrogate vocab that maps to base vocab, copy the logit
+            surrogate_ids_tensor = torch.arange(surrogate_vocab_size, device=self.device)
+            base_ids = self.vocab_aligner.lookup_surrogate_to_base[surrogate_ids_tensor]
+            
+            # Find valid mappings (not -100)
+            valid_mapping_mask = base_ids >= 0
+            valid_surrogate_ids = surrogate_ids_tensor[valid_mapping_mask]
+            valid_base_ids = base_ids[valid_mapping_mask]
+            
+            # Copy logits for valid mappings
+            # aligned_logits[batch, seq, valid_base_ids] = surrogate_logits[batch, seq, valid_surrogate_ids]
+            aligned_logits[:, :, valid_base_ids] = surrogate_logits[:, :, valid_surrogate_ids]
+            
+        return aligned_logits
+    
     def compute_surrogate_guidance(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1321,8 +1599,20 @@ class SurrogateTrainer:
         # Get labels
         labels = self.get_labels(batch)
         
-        # Compute surrogate guidance
-        perp_values, perp_indices = self.compute_surrogate_guidance(batch, labels)
+        # Get distillation mode
+        distillation_mode = self.config.distillation.mode.lower()
+        
+        # Compute guidance based on mode
+        perp_values, perp_indices = None, None
+        teacher_logits = None
+        
+        if distillation_mode == "surrogate":
+            # Surrogate-guided distillation (SDCE)
+            perp_values, perp_indices = self.compute_surrogate_guidance(batch, labels)
+        elif distillation_mode == "kd":
+            # Standard knowledge distillation
+            teacher_logits = self.compute_teacher_logits(batch)
+        # else: "none" - standard language modeling, no guidance needed
         
         # Forward pass with appropriate autocast context
         if self.use_autocast and not self.is_tpu:
@@ -1349,28 +1639,73 @@ class SurrogateTrainer:
             logits_flat = logits.view(-1, logits.size(-1))
             labels_flat = labels.view(-1)
             
-            # Get current surrogate loss weight (cosine decay)
-            surrogate_weight = self.get_surrogate_loss_weight()
+            # Compute loss based on distillation mode
+            if distillation_mode == "kd" and teacher_logits is not None:
+                # ============================================================
+                # Standard Knowledge Distillation mode
+                # ============================================================
+                kd_alpha = self.get_kd_alpha()
+                temperature = self.config.distillation.kd_temperature
+                
+                loss, z_loss, kd_metrics = knowledge_distillation_loss(
+                    student_logits=logits,
+                    teacher_logits=teacher_logits,
+                    labels=labels,
+                    temperature=temperature,
+                    alpha=kd_alpha,
+                    ignore_index=-100,
+                    reduction="mean",
+                    compute_z_loss=self.config.training.use_z_loss,
+                    z_loss_multiplier=self.config.training.z_loss_multiplier,
+                )
+                
+                ce_loss = loss  # For metrics compatibility
+                
+            elif distillation_mode == "surrogate":
+                # ============================================================
+                # Surrogate-guided distillation (SDCE) mode
+                # ============================================================
+                surrogate_weight = self.get_surrogate_loss_weight()
+                
+                lookup_table = None
+                if self.vocab_aligner is not None:
+                    lookup_table = self.vocab_aligner.lookup_surrogate_to_base
+                
+                ce_loss, z_loss = surrogate_cross_entropy_loss(
+                    logits=logits_flat if perp_indices is None else logits,
+                    labels=labels_flat if perp_indices is None else labels,
+                    perp_values=perp_values,
+                    perp_indices=perp_indices,
+                    lookup_surrogate_to_self=lookup_table,
+                    surrogate_weight=surrogate_weight,
+                    ignore_index=-100,
+                    reduction="mean",
+                    compute_z_loss=self.config.training.use_z_loss,
+                    z_loss_multiplier=self.config.training.z_loss_multiplier,
+                )
+                
+                loss = ce_loss
+                
+            else:
+                # ============================================================
+                # Standard language modeling (no distillation)
+                # ============================================================
+                ce_loss = F.cross_entropy(
+                    logits_flat,
+                    labels_flat,
+                    ignore_index=-100,
+                    reduction="mean",
+                )
+                
+                z_loss = None
+                if self.config.training.use_z_loss:
+                    z_squared = logits_flat.logsumexp(dim=-1).pow(2)
+                    valid_mask = (labels_flat != -100).float()
+                    z_loss = self.config.training.z_loss_multiplier * (z_squared * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+                
+                loss = ce_loss
             
-            # Compute loss
-            lookup_table = None
-            if self.vocab_aligner is not None:
-                lookup_table = self.vocab_aligner.lookup_surrogate_to_base
-            
-            ce_loss, z_loss = surrogate_cross_entropy_loss(
-                logits=logits_flat if perp_indices is None else logits,
-                labels=labels_flat if perp_indices is None else labels,
-                perp_values=perp_values,
-                perp_indices=perp_indices,
-                lookup_surrogate_to_self=lookup_table,
-                surrogate_weight=surrogate_weight,
-                ignore_index=-100,
-                reduction="mean",
-                compute_z_loss=self.config.training.use_z_loss,
-                z_loss_multiplier=self.config.training.z_loss_multiplier,
-            )
-            
-            loss = ce_loss
+            # Add z_loss if computed
             if z_loss is not None:
                 loss = loss + z_loss
             
@@ -1383,27 +1718,40 @@ class SurrogateTrainer:
         else:
             loss.backward()
         
+        # Build metrics dict
         metrics = {
             "loss": ce_loss.item(),
             "perplexity": math.exp(min(ce_loss.item(), 20)),
-            "surrogate_weight": surrogate_weight,
+            "distillation_mode": distillation_mode,
         }
+        
         if z_loss is not None:
             metrics["z_loss"] = z_loss.item()
         
-        # Track number of auxiliary tokens selected by surrogate
-        if perp_indices is not None and perp_values is not None:
-            # Count valid tokens (not -1 index and not inf perplexity)
-            valid_mask = (perp_indices >= 0) & (~torch.isinf(perp_values))
-            num_aux_tokens = valid_mask.sum().item()
-            # Also compute average per position (for positions that have at least one token)
-            num_positions = perp_indices.shape[0] * perp_indices.shape[1]
-            positions_with_tokens = valid_mask.any(dim=-1).sum().item()
+        # Mode-specific metrics
+        if distillation_mode == "kd" and teacher_logits is not None:
+            kd_alpha = self.get_kd_alpha()
+            metrics["kd_alpha"] = kd_alpha
+            metrics["kd_temperature"] = self.config.distillation.kd_temperature
+            if 'kd_metrics' in dir() and kd_metrics:
+                metrics["kd_loss_component"] = kd_metrics.get('kd_loss', 0.0)
+                metrics["ce_loss_component"] = kd_metrics.get('ce_loss', 0.0)
+                
+        elif distillation_mode == "surrogate":
+            surrogate_weight = self.get_surrogate_loss_weight()
+            metrics["surrogate_weight"] = surrogate_weight
             
-            metrics["aux_tokens_total"] = num_aux_tokens
-            metrics["aux_tokens_per_position"] = num_aux_tokens / (num_positions + 1e-8)
-            metrics["positions_with_aux_tokens"] = positions_with_tokens
-            metrics["positions_with_aux_tokens_pct"] = 100.0 * positions_with_tokens / (num_positions + 1e-8)
+            # Track number of auxiliary tokens selected by surrogate
+            if perp_indices is not None and perp_values is not None:
+                valid_mask = (perp_indices >= 0) & (~torch.isinf(perp_values))
+                num_aux_tokens = valid_mask.sum().item()
+                num_positions = perp_indices.shape[0] * perp_indices.shape[1]
+                positions_with_tokens = valid_mask.any(dim=-1).sum().item()
+                
+                metrics["aux_tokens_total"] = num_aux_tokens
+                metrics["aux_tokens_per_position"] = num_aux_tokens / (num_positions + 1e-8)
+                metrics["positions_with_aux_tokens"] = positions_with_tokens
+                metrics["positions_with_aux_tokens_pct"] = 100.0 * positions_with_tokens / (num_positions + 1e-8)
         
         return metrics
     
@@ -1969,6 +2317,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_surrogate", action="store_true", help="Disable surrogate model")
     parser.add_argument("--surrogate_loss_weight_initial", type=float, help="Initial surrogate loss weight")
     parser.add_argument("--surrogate_loss_weight_final", type=float, help="Final surrogate loss weight after decay")
+    
+    # Distillation arguments
+    parser.add_argument("--distillation_mode", type=str, choices=["surrogate", "kd", "none"],
+                        help="Distillation mode: 'surrogate' (SDCE), 'kd' (standard KD), or 'none'")
+    parser.add_argument("--kd_temperature", type=float, help="Temperature for KD softening (typical: 2-20)")
+    parser.add_argument("--kd_alpha", type=float, help="Weight for KD loss vs CE loss (0-1)")
+    parser.add_argument("--kd_alpha_schedule", action="store_true", help="Enable alpha scheduling for KD")
+    parser.add_argument("--kd_alpha_initial", type=float, help="Initial alpha for scheduled KD")
+    parser.add_argument("--kd_alpha_final", type=float, help="Final alpha for scheduled KD")
     
     # Data arguments
     parser.add_argument("--dataset", type=str, help="HuggingFace dataset name")
