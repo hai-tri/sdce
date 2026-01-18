@@ -29,6 +29,31 @@ surrogate:
   loss_weight_initial: 1.0  # Starting weight for surrogate loss
   loss_weight_final: 0.0    # Final weight (decays to this via cosine schedule)
 
+# Distillation configuration
+# =========================================================
+# Supports two distillation modes:
+#   - "surrogate": Custom surrogate-guided distillation (SDCE)
+#                  Uses perplexity-weighted tokens from surrogate model
+#   - "kd":        Standard knowledge distillation (Hinton et al., 2015)
+#                  Uses KL divergence between teacher/student distributions
+#   - "none":      No distillation, standard language modeling only
+distillation:
+  mode: "surrogate"           # "surrogate", "kd", or "none"
+  
+  # Knowledge Distillation (KD) specific parameters
+  # Only used when mode: "kd"
+  kd_temperature: 4.0         # Temperature for softening distributions (typical: 2-20)
+  kd_alpha: 0.5               # Weight for KD loss vs CE loss
+                              # alpha=1.0: only distillation loss
+                              # alpha=0.0: only cross-entropy loss
+                              # alpha=0.5: equal weighting (recommended)
+  
+  # Alpha scheduling (optional, for "kd" mode)
+  # If enabled, alpha decays from kd_alpha_initial to kd_alpha_final
+  kd_alpha_schedule: false    # Enable alpha scheduling
+  kd_alpha_initial: 0.9       # Initial alpha value
+  kd_alpha_final: 0.1         # Final alpha value (after cosine decay)
+
 # Data configuration
 data:
   dataset_name: "wikitext"          # HuggingFace dataset name
@@ -85,14 +110,14 @@ training:
   # resume_from_checkpoint: "./outputs/checkpoint-1000"
   
   # Weights & Biases logging
-  wandb_project: "project-name"
-  wandb_run_name: "run-name"
-  wandb_entity: "entity-name"
+  wandb_project: "SDCE"
+  wandb_run_name: "gpt2-test-run-2"
+  wandb_entity: "nathanngtruong-university-of-california-berkeley"
 
 # Benchmark evaluation configuration (lm-evaluation-harness)
 evaluation:
   enabled: true                    # Enable/disable benchmark evaluation
-  eval_interval: 500              # Run benchmarks every N steps
+  eval_interval: 5              # Run benchmarks every N steps
   
   # Benchmark tasks to run
   # Common options: "hellaswag", "arc_easy", "arc_challenge", "winogrande", 
@@ -108,7 +133,6 @@ evaluation:
     - "arc_challenge"
     - 'arc_easy'
     - 'lambada_openai'
-    - 'bbh'
     - 'agieval'
     - 'openbookqa'
     
