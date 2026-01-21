@@ -1,761 +1,681 @@
-#!/usr/bin/env python3
 """
 Surrogate-Assisted Language Model Training Script
-Supports both continual pretraining (from pretrained weights) and 
-pretraining from scratch (random weight initialization).
+
+Trains a language model from scratch with optional surrogate model guidance.
+Supports configurable storage directories for models, datasets, and checkpoints.
 """
 
 import os
+import sys
 import math
-import random
-import logging
+import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-import numpy as np
+import yaml
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-import yaml
-from omegaconf import OmegaConf
-from tqdm import tqdm
-
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     AutoConfig,
-    default_data_collator,
     get_scheduler,
 )
-from datasets import load_dataset, Dataset, DatasetDict
+from datasets import load_dataset, DatasetDict
+from tqdm import tqdm
+import numpy as np
 
-import wandb
+# Optional imports
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
-from losses import (
-    compute_cross_entropy_loss,
-    compute_surrogate_distillation_loss,
-    compute_kd_loss,
-    compute_z_loss,
-)
-
-# Setup logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+from losses import compute_combined_loss
 
 
-def set_seed(seed: int):
-    """Set random seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+# =============================================================================
+# Storage Configuration
+# =============================================================================
 
-
-def load_config(config_path: str) -> OmegaConf:
-    """Load configuration from YAML file."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    return OmegaConf.create(config)
-
-
-def get_device(config: OmegaConf) -> torch.device:
-    """Determine the device to use for training."""
-    device_str = config.training.get("device", "auto")
+class StorageManager:
+    """Manages storage directories for models, datasets, and outputs."""
     
-    if device_str == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        else:
-            return torch.device("cpu")
-    elif device_str == "tpu":
-        try:
-            import torch_xla.core.xla_model as xm
-            return xm.xla_device()
-        except ImportError:
-            logger.warning("TPU requested but torch_xla not available. Falling back to CPU.")
-            return torch.device("cpu")
-    else:
-        return torch.device(device_str)
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize storage manager from config.
+        
+        Args:
+            config: Configuration dictionary with 'storage' section
+        """
+        storage_cfg = config.get('storage', {})
+        
+        # Base directory (default to ./storage)
+        self.base_dir = Path(storage_cfg.get('base_dir', './storage')).resolve()
+        
+        # Subdirectories
+        self.models_dir = self._resolve_path(storage_cfg.get('models_dir', 'models'))
+        self.datasets_dir = self._resolve_path(storage_cfg.get('datasets_dir', 'datasets'))
+        self.checkpoints_dir = self._resolve_path(storage_cfg.get('checkpoints_dir', 'checkpoints'))
+        self.logs_dir = self._resolve_path(storage_cfg.get('logs_dir', 'logs'))
+        
+        # Options
+        self.use_hf_cache = storage_cfg.get('use_hf_cache', False)
+        self.set_hf_env_vars = storage_cfg.get('set_hf_env_vars', True)
+        
+        # Create directories
+        self._create_directories()
+        
+        # Set environment variables if requested
+        if self.set_hf_env_vars and not self.use_hf_cache:
+            self._set_environment_variables()
+    
+    def _resolve_path(self, path: str) -> Path:
+        """Resolve a path, making it relative to base_dir if not absolute."""
+        p = Path(path)
+        if p.is_absolute():
+            return p
+        return self.base_dir / p
+    
+    def _create_directories(self):
+        """Create all storage directories."""
+        for dir_path in [self.base_dir, self.models_dir, self.datasets_dir, 
+                         self.checkpoints_dir, self.logs_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            print(f"Storage directory: {dir_path}")
+    
+    def _set_environment_variables(self):
+        """Set HuggingFace environment variables for caching."""
+        # HF_HOME is the main cache directory
+        os.environ['HF_HOME'] = str(self.models_dir)
+        
+        # These are more specific cache locations
+        os.environ['HF_DATASETS_CACHE'] = str(self.datasets_dir)
+        os.environ['TRANSFORMERS_CACHE'] = str(self.models_dir / 'transformers')
+        os.environ['HUGGINGFACE_HUB_CACHE'] = str(self.models_dir / 'hub')
+        
+        print(f"Set HF_HOME={os.environ['HF_HOME']}")
+        print(f"Set HF_DATASETS_CACHE={os.environ['HF_DATASETS_CACHE']}")
+        print(f"Set TRANSFORMERS_CACHE={os.environ['TRANSFORMERS_CACHE']}")
+    
+    def get_model_cache_dir(self) -> Path:
+        """Get the directory for caching models."""
+        if self.use_hf_cache:
+            return None  # Use default HF cache
+        return self.models_dir
+    
+    def get_dataset_cache_dir(self) -> Path:
+        """Get the directory for caching datasets."""
+        if self.use_hf_cache:
+            return None  # Use default HF cache
+        return self.datasets_dir
+    
+    def get_checkpoint_dir(self, run_name: str = None) -> Path:
+        """Get the directory for saving checkpoints."""
+        if run_name:
+            return self.checkpoints_dir / run_name
+        return self.checkpoints_dir
+    
+    def get_log_dir(self, run_name: str = None) -> Path:
+        """Get the directory for saving logs."""
+        if run_name:
+            return self.logs_dir / run_name
+        return self.logs_dir
 
 
-def get_dtype(dtype_str: str) -> torch.dtype:
-    """Convert string dtype to torch dtype."""
+# =============================================================================
+# Model Loading
+# =============================================================================
+
+def load_model(
+    model_name: str,
+    storage_manager: StorageManager,
+    dtype: str = "bfloat16",
+    use_flash_attention: bool = True,
+    gradient_checkpointing: bool = True,
+    init_from_scratch: bool = False,
+    trust_remote_code: bool = False,
+) -> AutoModelForCausalLM:
+    """
+    Load or initialize a causal language model.
+    
+    Args:
+        model_name: HuggingFace model name or path
+        storage_manager: StorageManager instance for caching
+        dtype: Data type for model weights
+        use_flash_attention: Whether to use Flash Attention 2
+        gradient_checkpointing: Whether to enable gradient checkpointing
+        init_from_scratch: If True, initialize weights randomly
+        trust_remote_code: Whether to trust remote code
+    
+    Returns:
+        Loaded or initialized model
+    """
+    # Resolve dtype
     dtype_map = {
-        "float16": torch.float16,
-        "fp16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
         "float32": torch.float32,
-        "fp32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
     }
-    return dtype_map.get(dtype_str.lower(), torch.float32)
+    torch_dtype = dtype_map.get(dtype, torch.bfloat16)
+    
+    # Model kwargs
+    model_kwargs = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": trust_remote_code,
+    }
+    
+    # Add Flash Attention if available and requested
+    if use_flash_attention:
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+    
+    # Cache directory
+    cache_dir = storage_manager.get_model_cache_dir()
+    if cache_dir:
+        model_kwargs["cache_dir"] = str(cache_dir)
+    
+    if init_from_scratch:
+        # Load config only, then initialize random weights
+        print(f"Initializing model from scratch using config from: {model_name}")
+        config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            cache_dir=cache_dir,
+        )
+        model = AutoModelForCausalLM.from_config(
+            config,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        # Apply Flash Attention manually if needed
+        if use_flash_attention:
+            model.config._attn_implementation = "flash_attention_2"
+    else:
+        # Load pretrained weights
+        print(f"Loading pretrained model: {model_name}")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            **model_kwargs,
+        )
+    
+    # Enable gradient checkpointing
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled")
+    
+    # Print model info
+    num_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {num_params:,} total, {trainable_params:,} trainable")
+    
+    return model
 
 
-def load_model_and_tokenizer(config: OmegaConf, device: torch.device):
+def load_tokenizer(
+    model_name: str,
+    storage_manager: StorageManager,
+    trust_remote_code: bool = False,
+) -> AutoTokenizer:
     """
-    Load the base model and tokenizer.
+    Load tokenizer for a model.
     
-    Supports two modes:
-    - Continual pretraining: Load pretrained weights (init_from_scratch: false)
-    - Pretraining from scratch: Random weight initialization (init_from_scratch: true)
+    Args:
+        model_name: HuggingFace model name or path
+        storage_manager: StorageManager instance for caching
+        trust_remote_code: Whether to trust remote code
+    
+    Returns:
+        Loaded tokenizer
     """
-    model_config = config.model
-    model_name = model_config.name_or_path
-    dtype = get_dtype(model_config.dtype)
-    init_from_scratch = model_config.get("init_from_scratch", False)
+    cache_dir = storage_manager.get_model_cache_dir()
     
-    logger.info(f"Loading tokenizer from {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
-        trust_remote_code=model_config.get("trust_remote_code", False),
+        trust_remote_code=trust_remote_code,
+        cache_dir=cache_dir,
     )
     
-    # Set pad token if not present
+    # Ensure pad token is set
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    if init_from_scratch:
-        # Pretraining from scratch: load config only, initialize weights randomly
-        logger.info(f"Initializing model from scratch with architecture from {model_name}")
-        model_architecture_config = AutoConfig.from_pretrained(
-            model_name,
-            trust_remote_code=model_config.get("trust_remote_code", False),
-        )
-        
-        # Apply any custom config modifications
-        if model_config.get("custom_config"):
-            for key, value in model_config.custom_config.items():
-                if hasattr(model_architecture_config, key):
-                    setattr(model_architecture_config, key, value)
-                    logger.info(f"Set model config {key} = {value}")
-        
-        model = AutoModelForCausalLM.from_config(
-            model_architecture_config,
-            torch_dtype=dtype,
-            trust_remote_code=model_config.get("trust_remote_code", False),
-        )
-        
-        # Initialize weights properly
-        logger.info("Initializing model weights...")
-        model.apply(model._init_weights)
-        
-        # Log parameter count
-        num_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model initialized with {num_params:,} parameters (random initialization)")
-    else:
-        # Continual pretraining: load pretrained weights
-        logger.info(f"Loading pretrained model from {model_name}")
-        
-        # Configure Flash Attention if requested
-        attn_implementation = None
-        if model_config.get("use_flash_attention", False):
-            attn_implementation = "flash_attention_2"
-            logger.info("Using Flash Attention 2")
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            trust_remote_code=model_config.get("trust_remote_code", False),
-            attn_implementation=attn_implementation,
-        )
-        
-        num_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model loaded with {num_params:,} parameters (pretrained weights)")
-    
-    # Enable gradient checkpointing if requested
-    if model_config.get("gradient_checkpointing", False):
-        model.gradient_checkpointing_enable()
-        logger.info("Gradient checkpointing enabled")
-    
-    model = model.to(device)
-    return model, tokenizer
+    return tokenizer
 
 
-def load_surrogate_model(config: OmegaConf, device: torch.device):
-    """Load the surrogate model for guidance signals."""
-    surrogate_config = config.surrogate
-    
-    if not surrogate_config.get("enabled", True):
-        logger.info("Surrogate model disabled")
-        return None, None
-    
-    model_name = surrogate_config.name_or_path
-    dtype = get_dtype(surrogate_config.dtype)
-    
-    logger.info(f"Loading surrogate model from {model_name}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=surrogate_config.get("trust_remote_code", False),
-    )
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        trust_remote_code=surrogate_config.get("trust_remote_code", False),
-    )
-    
-    # Surrogate model is always frozen
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    model = model.to(device)
-    
-    num_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Surrogate model loaded with {num_params:,} parameters (frozen)")
-    
-    return model, tokenizer
+# =============================================================================
+# Data Loading
+# =============================================================================
 
-
-def prepare_dataset(config: OmegaConf, tokenizer) -> DatasetDict:
-    """Load and preprocess the dataset."""
-    data_config = config.data
+def load_and_prepare_dataset(
+    config: Dict[str, Any],
+    tokenizer: AutoTokenizer,
+    storage_manager: StorageManager,
+) -> DatasetDict:
+    """
+    Load and tokenize dataset.
+    
+    Args:
+        config: Configuration dictionary
+        tokenizer: Tokenizer for encoding text
+        storage_manager: StorageManager instance for caching
+    
+    Returns:
+        Tokenized dataset dict with 'train' and 'validation' splits
+    """
+    data_cfg = config['data']
+    
+    dataset_name = data_cfg['dataset_name']
+    dataset_config = data_cfg.get('dataset_config')
+    text_column = data_cfg.get('text_column', 'text')
+    max_seq_length = data_cfg.get('max_seq_length', 2048)
+    num_workers = data_cfg.get('preprocessing_num_workers', 4)
+    eval_ratio = data_cfg.get('eval_ratio', 0.005)
+    
+    cache_dir = storage_manager.get_dataset_cache_dir()
+    
+    print(f"Loading dataset: {dataset_name}")
     
     # Load dataset
-    if data_config.get("train_file"):
-        # Custom dataset from files
-        data_files = {"train": data_config.train_file}
-        if data_config.get("eval_file"):
-            data_files["validation"] = data_config.eval_file
-        dataset = load_dataset("json", data_files=data_files)
-    else:
-        # HuggingFace dataset
-        dataset_name = data_config.dataset_name
-        dataset_config_name = data_config.get("dataset_config")
-        
-        logger.info(f"Loading dataset: {dataset_name}" + 
-                   (f" ({dataset_config_name})" if dataset_config_name else ""))
-        
-        dataset = load_dataset(
-            dataset_name,
-            dataset_config_name,
-            trust_remote_code=True,
-        )
+    dataset = load_dataset(
+        dataset_name,
+        dataset_config,
+        cache_dir=cache_dir,
+        trust_remote_code=True,
+    )
     
-    # Check if we need to create a validation split
-    train_split = data_config.get("dataset_split", "train")
-    eval_split = data_config.get("eval_split", "validation")
-    
-    if eval_split not in dataset and "test" not in dataset:
-        # Create validation split from training data
-        eval_ratio = data_config.get("eval_ratio", 0.01)  # Default 1% for eval
-        logger.info(f"Creating validation split with {eval_ratio*100:.1f}% of training data")
-        
-        train_data = dataset[train_split]
-        split_dataset = train_data.train_test_split(
+    # Handle train/validation split
+    if 'validation' not in dataset:
+        print(f"Creating validation split ({eval_ratio*100:.1f}% of training data)")
+        split_dataset = dataset['train'].train_test_split(
             test_size=eval_ratio,
-            seed=config.training.get("seed", 42),
+            seed=config['training'].get('seed', 42),
         )
         dataset = DatasetDict({
-            "train": split_dataset["train"],
-            "validation": split_dataset["test"],
+            'train': split_dataset['train'],
+            'validation': split_dataset['test'],
         })
-        eval_split = "validation"
-    elif eval_split not in dataset and "test" in dataset:
-        eval_split = "test"
     
-    # Get text column
-    text_column = data_config.get("text_column", "text")
-    max_seq_length = data_config.max_seq_length
-    
+    # Tokenization function
     def tokenize_function(examples):
-        """Tokenize and chunk text into fixed-length sequences."""
-        # Concatenate all texts
-        texts = examples[text_column]
-        
-        # Filter out empty strings
-        texts = [t for t in texts if t and len(t.strip()) > 0]
-        
-        if not texts:
-            return {"input_ids": [], "attention_mask": [], "labels": []}
-        
         # Tokenize
         tokenized = tokenizer(
-            texts,
-            truncation=False,
+            examples[text_column],
+            truncation=True,
+            max_length=max_seq_length,
             padding=False,
             return_attention_mask=False,
         )
         
-        # Concatenate all token ids
-        concatenated_ids = []
-        for ids in tokenized["input_ids"]:
-            concatenated_ids.extend(ids)
+        # For causal LM, labels are the same as input_ids
+        tokenized["labels"] = tokenized["input_ids"].copy()
         
-        # Chunk into fixed-length sequences
-        total_length = len(concatenated_ids)
+        return tokenized
+    
+    # Group texts for efficient training
+    def group_texts(examples):
+        # Concatenate all texts
+        concatenated = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = len(concatenated["input_ids"])
+        
+        # Drop remainder that doesn't fit into a full block
         total_length = (total_length // max_seq_length) * max_seq_length
         
+        # Split into chunks
         result = {
-            "input_ids": [],
-            "attention_mask": [],
-            "labels": [],
+            k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+            for k, t in concatenated.items()
         }
-        
-        for i in range(0, total_length, max_seq_length):
-            chunk = concatenated_ids[i:i + max_seq_length]
-            result["input_ids"].append(chunk)
-            result["attention_mask"].append([1] * len(chunk))
-            result["labels"].append(chunk.copy())
         
         return result
     
-    # Process dataset
-    num_workers = data_config.get("preprocessing_num_workers", 4)
-    
-    logger.info("Tokenizing dataset...")
+    # Apply tokenization
+    print("Tokenizing dataset...")
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
         num_proc=num_workers,
-        remove_columns=dataset[train_split].column_names,
+        remove_columns=dataset['train'].column_names,
         desc="Tokenizing",
     )
     
-    # Filter out empty examples
-    tokenized_dataset = tokenized_dataset.filter(
-        lambda x: len(x["input_ids"]) > 0
+    # Group texts
+    print("Grouping texts into chunks...")
+    tokenized_dataset = tokenized_dataset.map(
+        group_texts,
+        batched=True,
+        num_proc=num_workers,
+        desc="Grouping texts",
     )
     
-    logger.info(f"Train examples: {len(tokenized_dataset[train_split])}")
-    if eval_split in tokenized_dataset:
-        logger.info(f"Eval examples: {len(tokenized_dataset[eval_split])}")
+    print(f"Training samples: {len(tokenized_dataset['train']):,}")
+    print(f"Validation samples: {len(tokenized_dataset['validation']):,}")
     
-    return tokenized_dataset, train_split, eval_split
+    return tokenized_dataset
 
 
-def get_surrogate_loss_weight(
-    step: int,
+# =============================================================================
+# Training Utilities
+# =============================================================================
+
+def get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = 0.1,
+):
+    """Create cosine schedule with linear warmup."""
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def get_surrogate_weight(
+    current_step: int,
     total_steps: int,
-    initial_weight: float,
-    final_weight: float,
+    initial_weight: float = 1.0,
+    final_weight: float = 0.0,
 ) -> float:
-    """Calculate surrogate loss weight using cosine decay schedule."""
-    if total_steps == 0:
-        return initial_weight
-    
-    progress = min(step / total_steps, 1.0)
+    """Calculate surrogate loss weight using cosine decay."""
+    progress = current_step / max(1, total_steps)
     # Cosine decay from initial to final
-    weight = final_weight + (initial_weight - final_weight) * 0.5 * (1 + math.cos(math.pi * progress))
+    weight = final_weight + 0.5 * (initial_weight - final_weight) * (1 + math.cos(math.pi * progress))
     return weight
 
 
-def get_kd_alpha(
-    step: int,
-    total_steps: int,
-    config: OmegaConf,
-) -> float:
-    """Get KD alpha value, optionally with scheduling."""
-    distill_config = config.distillation
-    
-    if not distill_config.get("kd_alpha_schedule", False):
-        return distill_config.get("kd_alpha", 0.5)
-    
-    initial_alpha = distill_config.get("kd_alpha_initial", 0.9)
-    final_alpha = distill_config.get("kd_alpha_final", 0.1)
-    
-    if total_steps == 0:
-        return initial_alpha
-    
-    progress = min(step / total_steps, 1.0)
-    # Cosine decay from initial to final
-    alpha = final_alpha + (initial_alpha - final_alpha) * 0.5 * (1 + math.cos(math.pi * progress))
-    return alpha
-
-
-def evaluate(
-    model,
-    eval_dataloader,
-    device,
-    config: OmegaConf,
-) -> Dict[str, float]:
-    """Run evaluation and return metrics."""
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    
-    with torch.no_grad():
-        for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-            
-            loss = compute_cross_entropy_loss(outputs.logits, labels)
-            
-            # Count tokens (excluding padding)
-            num_tokens = (labels != -100).sum().item()
-            total_loss += loss.item() * num_tokens
-            total_tokens += num_tokens
-    
-    model.train()
-    
-    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-    perplexity = math.exp(avg_loss) if avg_loss < 20 else float("inf")
+def collate_fn(batch, pad_token_id: int = 0):
+    """Collate function for DataLoader."""
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(item['input_ids']) for item in batch],
+        batch_first=True,
+        padding_value=pad_token_id,
+    )
+    labels = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(item['labels']) for item in batch],
+        batch_first=True,
+        padding_value=-100,  # Ignore index for loss
+    )
+    attention_mask = (input_ids != pad_token_id).long()
     
     return {
-        "eval_loss": avg_loss,
-        "eval_perplexity": perplexity,
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels,
     }
 
 
-def run_benchmarks(
-    model,
-    tokenizer,
-    config: OmegaConf,
-    step: int,
-) -> Dict[str, float]:
-    """Run lm-evaluation-harness benchmarks."""
-    eval_config = config.evaluation
-    
-    if not eval_config.get("enabled", False):
-        return {}
-    
-    try:
-        from lm_eval import evaluator
-        from lm_eval.models.huggingface import HFLM
-    except ImportError:
-        logger.warning("lm-eval not installed. Skipping benchmarks.")
-        return {}
-    
-    logger.info(f"Running benchmarks at step {step}...")
-    
-    # Wrap model for lm-eval
-    lm = HFLM(
-        pretrained=model,
-        tokenizer=tokenizer,
-        batch_size=eval_config.get("batch_size", 8),
-    )
-    
-    tasks = eval_config.get("tasks", ["hellaswag"])
-    num_fewshot = eval_config.get("num_fewshot", 0)
-    limit = eval_config.get("limit")
-    
-    results = evaluator.simple_evaluate(
-        model=lm,
-        tasks=tasks,
-        num_fewshot=num_fewshot,
-        limit=limit,
-    )
-    
-    metrics = {}
-    
-    if eval_config.get("log_individual_tasks", True):
-        for task_name, task_results in results["results"].items():
-            # Get the main accuracy metric
-            for metric_name, value in task_results.items():
-                if "acc" in metric_name.lower() and "stderr" not in metric_name.lower():
-                    metrics[f"benchmark/{task_name}_{metric_name}"] = value
-    
-    if eval_config.get("log_aggregate_score", True):
-        # Calculate mean accuracy across tasks
-        accuracies = []
-        for task_results in results["results"].values():
-            for metric_name, value in task_results.items():
-                if metric_name == "acc" or metric_name == "acc_norm":
-                    accuracies.append(value)
-                    break
-        
-        if accuracies:
-            metrics["benchmark/mean_accuracy"] = np.mean(accuracies)
-    
-    return metrics
+# =============================================================================
+# Main Training Loop
+# =============================================================================
 
-
-def train(config_path: str):
-    """Main training function."""
-    # Load configuration
-    config = load_config(config_path)
+def train(config: Dict[str, Any]):
+    """
+    Main training function.
+    
+    Args:
+        config: Configuration dictionary
+    """
+    # Initialize storage manager
+    storage_manager = StorageManager(config)
+    
+    # Extract config sections
+    model_cfg = config['model']
+    surrogate_cfg = config.get('surrogate', {})
+    distillation_cfg = config.get('distillation', {})
+    training_cfg = config['training']
     
     # Set seed
-    seed = config.training.get("seed", 42)
-    set_seed(seed)
+    seed = training_cfg.get('seed', 42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     
-    # Get device
-    device = get_device(config)
-    logger.info(f"Using device: {device}")
+    # Device setup
+    device_str = training_cfg.get('device', 'auto')
+    if device_str == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(device_str)
+    print(f"Using device: {device}")
     
-    # Initialize wandb
-    if config.training.get("wandb_project"):
-        wandb.init(
-            project=config.training.wandb_project,
-            name=config.training.get("wandb_run_name"),
-            entity=config.training.get("wandb_entity"),
-            config=OmegaConf.to_container(config, resolve=True),
+    # Load tokenizer (use student model's tokenizer)
+    tokenizer = load_tokenizer(
+        model_cfg['name_or_path'],
+        storage_manager,
+        trust_remote_code=model_cfg.get('trust_remote_code', False),
+    )
+    
+    # Load student model
+    print("\n=== Loading Student Model ===")
+    student_model = load_model(
+        model_cfg['name_or_path'],
+        storage_manager,
+        dtype=model_cfg.get('dtype', 'bfloat16'),
+        use_flash_attention=model_cfg.get('use_flash_attention', True),
+        gradient_checkpointing=model_cfg.get('gradient_checkpointing', True),
+        init_from_scratch=model_cfg.get('init_from_scratch', False),
+        trust_remote_code=model_cfg.get('trust_remote_code', False),
+    )
+    student_model.to(device)
+    
+    # Load surrogate model if enabled
+    surrogate_model = None
+    surrogate_tokenizer = None
+    if surrogate_cfg.get('enabled', False) and distillation_cfg.get('mode') != 'none':
+        print("\n=== Loading Surrogate Model ===")
+        surrogate_model = load_model(
+            surrogate_cfg['name_or_path'],
+            storage_manager,
+            dtype=surrogate_cfg.get('dtype', 'bfloat16'),
+            use_flash_attention=False,  # Surrogate doesn't need FA
+            gradient_checkpointing=False,  # Surrogate is frozen
+            init_from_scratch=False,  # Always use pretrained surrogate
+            trust_remote_code=surrogate_cfg.get('trust_remote_code', False),
         )
+        surrogate_model.to(device)
+        surrogate_model.eval()
+        
+        # Freeze surrogate
+        for param in surrogate_model.parameters():
+            param.requires_grad = False
+        
+        # Load surrogate tokenizer if different from student
+        if surrogate_cfg['name_or_path'] != model_cfg['name_or_path']:
+            surrogate_tokenizer = load_tokenizer(
+                surrogate_cfg['name_or_path'],
+                storage_manager,
+                trust_remote_code=surrogate_cfg.get('trust_remote_code', False),
+            )
     
-    # Load models
-    model, tokenizer = load_model_and_tokenizer(config, device)
-    surrogate_model, surrogate_tokenizer = load_surrogate_model(config, device)
+    # Load dataset
+    print("\n=== Loading Dataset ===")
+    dataset = load_and_prepare_dataset(config, tokenizer, storage_manager)
     
-    # Prepare dataset
-    dataset, train_split, eval_split = prepare_dataset(config, tokenizer)
+    # Create data loaders
+    train_batch_size = training_cfg.get('per_device_train_batch_size', 4)
+    eval_batch_size = training_cfg.get('per_device_eval_batch_size', 4)
     
-    # Create dataloaders
-    train_batch_size = config.training.per_device_train_batch_size
-    eval_batch_size = config.training.get("per_device_eval_batch_size", train_batch_size)
+    from functools import partial
+    collate = partial(collate_fn, pad_token_id=tokenizer.pad_token_id)
     
-    train_dataloader = DataLoader(
-        dataset[train_split],
+    train_loader = DataLoader(
+        dataset['train'],
         batch_size=train_batch_size,
         shuffle=True,
-        collate_fn=default_data_collator,
-        num_workers=2,
+        collate_fn=collate,
+        num_workers=4,
         pin_memory=True,
     )
     
-    eval_dataloader = None
-    if eval_split in dataset:
-        eval_dataloader = DataLoader(
-            dataset[eval_split],
-            batch_size=eval_batch_size,
-            shuffle=False,
-            collate_fn=default_data_collator,
-            num_workers=2,
-            pin_memory=True,
-        )
+    eval_loader = DataLoader(
+        dataset['validation'],
+        batch_size=eval_batch_size,
+        shuffle=False,
+        collate_fn=collate,
+        num_workers=4,
+        pin_memory=True,
+    )
     
     # Calculate training steps
-    num_epochs = config.training.num_epochs
-    gradient_accumulation_steps = config.training.get("gradient_accumulation_steps", 1)
-    num_update_steps_per_epoch = len(train_dataloader) // gradient_accumulation_steps
-    total_steps = num_update_steps_per_epoch * num_epochs
+    num_epochs = training_cfg.get('num_epochs', 1)
+    gradient_accumulation_steps = training_cfg.get('gradient_accumulation_steps', 1)
+    num_update_steps_per_epoch = len(train_loader) // gradient_accumulation_steps
+    total_training_steps = num_epochs * num_update_steps_per_epoch
+    warmup_ratio = training_cfg.get('warmup_ratio', 0.01)
+    num_warmup_steps = int(total_training_steps * warmup_ratio)
     
-    logger.info(f"Total training steps: {total_steps}")
-    logger.info(f"Steps per epoch: {num_update_steps_per_epoch}")
+    print(f"\nTraining for {num_epochs} epochs")
+    print(f"Steps per epoch: {num_update_steps_per_epoch:,}")
+    print(f"Total training steps: {total_training_steps:,}")
+    print(f"Warmup steps: {num_warmup_steps:,}")
     
-    # Setup optimizer
+    # Optimizer
     optimizer = AdamW(
-        model.parameters(),
-        lr=config.training.learning_rate,
-        weight_decay=config.training.get("weight_decay", 0.01),
+        student_model.parameters(),
+        lr=training_cfg.get('learning_rate', 3e-4),
+        weight_decay=training_cfg.get('weight_decay', 0.1),
+        betas=(0.9, 0.95),
     )
     
-    # Setup scheduler
-    warmup_steps = config.training.get("warmup_steps")
-    if warmup_steps is None:
-        warmup_ratio = config.training.get("warmup_ratio", 0.1)
-        warmup_steps = int(total_steps * warmup_ratio)
-    
-    scheduler = get_scheduler(
-        name=config.training.get("lr_scheduler_type", "cosine"),
-        optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
+    # Scheduler
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=total_training_steps,
     )
     
-    # Mixed precision setup
-    mixed_precision = config.training.get("mixed_precision", "no")
-    scaler = None
-    if mixed_precision in ["fp16", "float16"] and device.type == "cuda":
-        scaler = torch.amp.GradScaler("cuda")
-        autocast_dtype = torch.float16
-    elif mixed_precision in ["bf16", "bfloat16"]:
+    # Mixed precision
+    mixed_precision = training_cfg.get('mixed_precision', 'bf16')
+    if mixed_precision == 'bf16':
+        scaler = None  # bf16 doesn't need scaler
         autocast_dtype = torch.bfloat16
+    elif mixed_precision == 'fp16':
+        scaler = torch.cuda.amp.GradScaler()
+        autocast_dtype = torch.float16
     else:
-        autocast_dtype = None
+        scaler = None
+        autocast_dtype = torch.float32
     
-    # Training settings
-    distillation_mode = config.distillation.get("mode", "surrogate")
-    use_z_loss = config.training.get("use_z_loss", False)
-    z_loss_multiplier = config.training.get("z_loss_multiplier", 1e-4)
-    max_grad_norm = config.training.get("max_grad_norm", 1.0)
-    logging_steps = config.training.get("logging_steps", 10)
-    eval_steps = config.training.get("eval_steps", 500)
-    save_steps = config.training.get("save_steps", 1000)
-    eval_interval = config.evaluation.get("eval_interval", 1000) if config.get("evaluation") else None
+    # Initialize wandb
+    if WANDB_AVAILABLE and training_cfg.get('wandb_project'):
+        run_name = training_cfg.get('wandb_run_name', 'training-run')
+        wandb.init(
+            project=training_cfg['wandb_project'],
+            entity=training_cfg.get('wandb_entity'),
+            name=run_name,
+            config=config,
+        )
     
-    # Surrogate settings
-    surrogate_weight_initial = config.surrogate.get("loss_weight_initial", 1.0)
-    surrogate_weight_final = config.surrogate.get("loss_weight_final", 0.0)
-    prob_threshold = config.surrogate.get("prob_threshold", 0.03)
-    max_tokens = config.surrogate.get("max_tokens", 100)
-    
-    # KD settings
-    kd_temperature = config.distillation.get("kd_temperature", 4.0)
-    
-    # Create output directory
-    output_dir = Path(config.training.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Checkpoint directory
+    run_name = training_cfg.get('wandb_run_name', 'training-run')
+    checkpoint_dir = storage_manager.get_checkpoint_dir(run_name)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     # Training loop
+    print("\n=== Starting Training ===")
     global_step = 0
-    model.train()
+    best_eval_loss = float('inf')
     
-    logger.info("Starting training...")
+    # Distillation settings
+    distillation_mode = distillation_cfg.get('mode', 'none')
+    prob_threshold = surrogate_cfg.get('prob_threshold', 0.03)
+    max_tokens = surrogate_cfg.get('max_tokens', 100)
+    kd_temperature = distillation_cfg.get('kd_temperature', 4.0)
+    use_z_loss = training_cfg.get('use_z_loss', False)
+    z_loss_weight = training_cfg.get('z_loss_multiplier', 1e-4)
     
     for epoch in range(num_epochs):
+        student_model.train()
         epoch_loss = 0.0
-        epoch_steps = 0
+        num_batches = 0
         
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
         
         for step, batch in enumerate(progress_bar):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            # Move batch to device
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
             
-            # Forward pass with mixed precision
-            if autocast_dtype:
-                with torch.amp.autocast(device.type, dtype=autocast_dtype):
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                    )
-                    logits = outputs.logits
-                    
-                    # Base cross-entropy loss
-                    ce_loss = compute_cross_entropy_loss(logits, labels)
-                    total_loss = ce_loss
-                    
-                    # Distillation loss
-                    distill_loss = torch.tensor(0.0, device=device)
-                    surrogate_weight = 0.0
-                    kd_alpha = 0.0
-                    
-                    if distillation_mode == "surrogate" and surrogate_model is not None:
-                        surrogate_weight = get_surrogate_loss_weight(
-                            global_step, total_steps,
-                            surrogate_weight_initial, surrogate_weight_final,
-                        )
-                        
-                        if surrogate_weight > 0:
-                            with torch.no_grad():
-                                surrogate_outputs = surrogate_model(
-                                    input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                )
-                            
-                            distill_loss = compute_surrogate_distillation_loss(
-                                student_logits=logits,
-                                teacher_logits=surrogate_outputs.logits,
-                                labels=labels,
-                                prob_threshold=prob_threshold,
-                                max_tokens=max_tokens,
-                            )
-                            total_loss = ce_loss + surrogate_weight * distill_loss
-                    
-                    elif distillation_mode == "kd" and surrogate_model is not None:
-                        kd_alpha = get_kd_alpha(global_step, total_steps, config)
-                        
-                        if kd_alpha > 0:
-                            with torch.no_grad():
-                                teacher_outputs = surrogate_model(
-                                    input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                )
-                            
-                            distill_loss = compute_kd_loss(
-                                student_logits=logits,
-                                teacher_logits=teacher_outputs.logits,
-                                labels=labels,
-                                temperature=kd_temperature,
-                            )
-                            total_loss = (1 - kd_alpha) * ce_loss + kd_alpha * distill_loss
-                    
-                    # Z-loss
-                    z_loss = torch.tensor(0.0, device=device)
-                    if use_z_loss:
-                        z_loss = compute_z_loss(logits)
-                        total_loss = total_loss + z_loss_multiplier * z_loss
-                    
-                    # Scale for gradient accumulation
-                    total_loss = total_loss / gradient_accumulation_steps
-            else:
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                )
-                logits = outputs.logits
-                
-                ce_loss = compute_cross_entropy_loss(logits, labels)
-                total_loss = ce_loss
-                
-                distill_loss = torch.tensor(0.0, device=device)
-                surrogate_weight = 0.0
-                kd_alpha = 0.0
-                
-                if distillation_mode == "surrogate" and surrogate_model is not None:
-                    surrogate_weight = get_surrogate_loss_weight(
-                        global_step, total_steps,
-                        surrogate_weight_initial, surrogate_weight_final,
-                    )
-                    
-                    if surrogate_weight > 0:
-                        with torch.no_grad():
+            # Get surrogate logits if needed
+            teacher_logits = None
+            if surrogate_model is not None and distillation_mode != 'none':
+                with torch.no_grad():
+                    with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                        # Handle different tokenizers if needed
+                        if surrogate_tokenizer is not None:
+                            # Re-tokenize for surrogate (simplified - in practice may need more care)
                             surrogate_outputs = surrogate_model(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
                             )
-                        
-                        distill_loss = compute_surrogate_distillation_loss(
-                            student_logits=logits,
-                            teacher_logits=surrogate_outputs.logits,
-                            labels=labels,
-                            prob_threshold=prob_threshold,
-                            max_tokens=max_tokens,
-                        )
-                        total_loss = ce_loss + surrogate_weight * distill_loss
-                
-                elif distillation_mode == "kd" and surrogate_model is not None:
-                    kd_alpha = get_kd_alpha(global_step, total_steps, config)
-                    
-                    if kd_alpha > 0:
-                        with torch.no_grad():
-                            teacher_outputs = surrogate_model(
+                        else:
+                            surrogate_outputs = surrogate_model(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
                             )
-                        
-                        distill_loss = compute_kd_loss(
-                            student_logits=logits,
-                            teacher_logits=teacher_outputs.logits,
-                            labels=labels,
-                            temperature=kd_temperature,
-                        )
-                        total_loss = (1 - kd_alpha) * ce_loss + kd_alpha * distill_loss
+                        teacher_logits = surrogate_outputs.logits
+            
+            # Forward pass with mixed precision
+            with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                student_outputs = student_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                student_logits = student_outputs.logits
                 
-                z_loss = torch.tensor(0.0, device=device)
-                if use_z_loss:
-                    z_loss = compute_z_loss(logits)
-                    total_loss = total_loss + z_loss_multiplier * z_loss
+                # Calculate surrogate weight (cosine decay)
+                surrogate_weight = get_surrogate_weight(
+                    global_step,
+                    total_training_steps,
+                    surrogate_cfg.get('loss_weight_initial', 1.0),
+                    surrogate_cfg.get('loss_weight_final', 0.0),
+                )
                 
-                total_loss = total_loss / gradient_accumulation_steps
+                # Compute combined loss
+                loss_dict = compute_combined_loss(
+                    student_logits=student_logits,
+                    teacher_logits=teacher_logits,
+                    labels=labels,
+                    distillation_mode=distillation_mode,
+                    distillation_weight=surrogate_weight,
+                    kd_temperature=kd_temperature,
+                    prob_threshold=prob_threshold,
+                    max_tokens=max_tokens,
+                    use_z_loss=use_z_loss,
+                    z_loss_weight=z_loss_weight,
+                )
+                
+                loss = loss_dict['total_loss'] / gradient_accumulation_steps
             
             # Backward pass
-            if scaler:
-                scaler.scale(total_loss).backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
             else:
-                total_loss.backward()
+                loss.backward()
             
-            epoch_loss += total_loss.item() * gradient_accumulation_steps
-            epoch_steps += 1
-            
-            # Gradient accumulation step
+            # Update weights
             if (step + 1) % gradient_accumulation_steps == 0:
-                if scaler:
+                # Gradient clipping
+                max_grad_norm = training_cfg.get('max_grad_norm', 1.0)
+                if scaler is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_grad_norm)
+                
+                if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
                 
                 scheduler.step()
@@ -763,117 +683,158 @@ def train(config_path: str):
                 global_step += 1
                 
                 # Logging
-                if global_step % logging_steps == 0:
-                    avg_loss = epoch_loss / epoch_steps
-                    current_lr = scheduler.get_last_lr()[0]
-                    
+                if global_step % training_cfg.get('logging_steps', 50) == 0:
+                    lr = scheduler.get_last_lr()[0]
                     log_dict = {
-                        "train/loss": avg_loss,
-                        "train/ce_loss": ce_loss.item(),
-                        "train/learning_rate": current_lr,
-                        "train/epoch": epoch + step / len(train_dataloader),
-                        "train/global_step": global_step,
+                        'train/loss': loss_dict['total_loss'].item(),
+                        'train/ce_loss': loss_dict['ce_loss'].item(),
+                        'train/learning_rate': lr,
+                        'train/surrogate_weight': surrogate_weight,
+                        'train/global_step': global_step,
                     }
                     
-                    if distillation_mode == "surrogate":
-                        log_dict["train/surrogate_loss"] = distill_loss.item()
-                        log_dict["train/surrogate_weight"] = surrogate_weight
-                    elif distillation_mode == "kd":
-                        log_dict["train/kd_loss"] = distill_loss.item()
-                        log_dict["train/kd_alpha"] = kd_alpha
+                    if 'surrogate_loss' in loss_dict:
+                        log_dict['train/surrogate_loss'] = loss_dict['surrogate_loss'].item()
+                    if 'kd_loss' in loss_dict:
+                        log_dict['train/kd_loss'] = loss_dict['kd_loss'].item()
+                    if 'z_loss' in loss_dict:
+                        log_dict['train/z_loss'] = loss_dict['z_loss'].item()
                     
-                    if use_z_loss:
-                        log_dict["train/z_loss"] = z_loss.item()
-                    
-                    if wandb.run:
+                    if WANDB_AVAILABLE and wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
                     
                     progress_bar.set_postfix({
-                        "loss": f"{avg_loss:.4f}",
-                        "lr": f"{current_lr:.2e}",
+                        'loss': f"{loss_dict['total_loss'].item():.4f}",
+                        'lr': f"{lr:.2e}",
                     })
                 
                 # Evaluation
-                if eval_dataloader and global_step % eval_steps == 0:
-                    eval_metrics = evaluate(model, eval_dataloader, device, config)
-                    logger.info(f"Step {global_step}: {eval_metrics}")
+                if global_step % training_cfg.get('eval_steps', 2000) == 0:
+                    eval_loss = evaluate(student_model, eval_loader, device, autocast_dtype)
+                    print(f"\nStep {global_step}: Eval Loss = {eval_loss:.4f}")
                     
-                    if wandb.run:
-                        wandb.log(eval_metrics, step=global_step)
-                
-                # Benchmark evaluation
-                if eval_interval and global_step % eval_interval == 0:
-                    benchmark_metrics = run_benchmarks(model, tokenizer, config, global_step)
-                    if benchmark_metrics:
-                        logger.info(f"Benchmarks at step {global_step}: {benchmark_metrics}")
-                        if wandb.run:
-                            wandb.log(benchmark_metrics, step=global_step)
+                    if WANDB_AVAILABLE and wandb.run is not None:
+                        wandb.log({'eval/loss': eval_loss}, step=global_step)
+                    
+                    if eval_loss < best_eval_loss:
+                        best_eval_loss = eval_loss
+                        # Save best model
+                        save_checkpoint(
+                            student_model, tokenizer, optimizer, scheduler,
+                            global_step, checkpoint_dir / 'best',
+                        )
+                    
+                    student_model.train()
                 
                 # Save checkpoint
-                if global_step % save_steps == 0:
-                    checkpoint_dir = output_dir / f"checkpoint-{global_step}"
-                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    model.save_pretrained(checkpoint_dir)
-                    tokenizer.save_pretrained(checkpoint_dir)
-                    
-                    # Save optimizer and scheduler state
-                    torch.save({
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "global_step": global_step,
-                        "epoch": epoch,
-                    }, checkpoint_dir / "training_state.pt")
-                    
-                    logger.info(f"Saved checkpoint to {checkpoint_dir}")
-                    
-                    # Clean up old checkpoints
-                    save_total_limit = config.training.get("save_total_limit", 3)
-                    checkpoints = sorted(output_dir.glob("checkpoint-*"), 
-                                        key=lambda x: int(x.name.split("-")[1]))
-                    if len(checkpoints) > save_total_limit:
-                        for ckpt in checkpoints[:-save_total_limit]:
-                            import shutil
-                            shutil.rmtree(ckpt)
-                            logger.info(f"Deleted old checkpoint: {ckpt}")
+                if global_step % training_cfg.get('save_steps', 5000) == 0:
+                    save_checkpoint(
+                        student_model, tokenizer, optimizer, scheduler,
+                        global_step, checkpoint_dir / f'checkpoint-{global_step}',
+                    )
+            
+            epoch_loss += loss_dict['total_loss'].item()
+            num_batches += 1
+        
+        # End of epoch
+        avg_epoch_loss = epoch_loss / num_batches
+        print(f"\nEpoch {epoch + 1} completed. Average loss: {avg_epoch_loss:.4f}")
     
-    # Final evaluation
-    if eval_dataloader:
-        final_metrics = evaluate(model, eval_dataloader, device, config)
-        logger.info(f"Final evaluation: {final_metrics}")
-        if wandb.run:
-            wandb.log({"final/" + k: v for k, v in final_metrics.items()}, step=global_step)
+    # Final save
+    save_checkpoint(
+        student_model, tokenizer, optimizer, scheduler,
+        global_step, checkpoint_dir / 'final',
+    )
     
-    # Final benchmark evaluation
-    final_benchmarks = run_benchmarks(model, tokenizer, config, global_step)
-    if final_benchmarks:
-        logger.info(f"Final benchmarks: {final_benchmarks}")
-        if wandb.run:
-            wandb.log({"final/" + k: v for k, v in final_benchmarks.items()}, step=global_step)
+    print("\n=== Training Complete ===")
+    print(f"Best eval loss: {best_eval_loss:.4f}")
+    print(f"Checkpoints saved to: {checkpoint_dir}")
     
-    # Save final model
-    final_dir = output_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    logger.info(f"Saved final model to {final_dir}")
-    
-    if wandb.run:
+    if WANDB_AVAILABLE and wandb.run is not None:
         wandb.finish()
-    
-    logger.info("Training complete!")
 
 
-if __name__ == "__main__":
-    import argparse
+def evaluate(model, eval_loader, device, autocast_dtype):
+    """Evaluate model on validation set."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
     
-    parser = argparse.ArgumentParser(description="Train a language model with surrogate guidance")
+    with torch.no_grad():
+        for batch in tqdm(eval_loader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                total_loss += outputs.loss.item()
+            
+            num_batches += 1
+    
+    return total_loss / num_batches
+
+
+def save_checkpoint(model, tokenizer, optimizer, scheduler, step, path):
+    """Save training checkpoint."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    
+    # Save model and tokenizer
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    
+    # Save training state
+    torch.save({
+        'step': step,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+    }, path / 'training_state.pt')
+    
+    print(f"Checkpoint saved to: {path}")
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Train language model with surrogate guidance")
     parser.add_argument(
-        "--config",
-        type=str,
-        default="config.yaml",
-        help="Path to configuration file",
+        '--config', type=str, default='config.yaml',
+        help='Path to configuration file'
+    )
+    parser.add_argument(
+        '--storage-dir', type=str, default=None,
+        help='Override base storage directory'
+    )
+    parser.add_argument(
+        '--output-dir', type=str, default=None,
+        help='Override output directory for checkpoints'
     )
     args = parser.parse_args()
     
-    train(args.config)
+    # Load config
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Override storage directory if provided
+    if args.storage_dir:
+        if 'storage' not in config:
+            config['storage'] = {}
+        config['storage']['base_dir'] = args.storage_dir
+    
+    # Override output directory if provided
+    if args.output_dir:
+        config['training']['output_dir'] = args.output_dir
+    
+    # Run training
+    train(config)
+
+
+if __name__ == '__main__':
+    main()
