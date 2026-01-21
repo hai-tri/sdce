@@ -19,15 +19,8 @@ numpy>=1.24.0
 # Benchmarking (lm-evaluation-harness)
 lm-eval>=0.4.0
 
-# Optional: Flash Attention (requires CUDA)
-# flash-attn>=2.3.0
+# Flash Attention 2 (for 4090/Ampere+ GPUs)
+flash-attn>=2.3.0
 
 # Optional: Accelerate for multi-GPU training
 # accelerate>=0.24.0
-
-# Optional: TPU support (PyTorch XLA)
-# Install from: https://github.com/pytorch/xla
-# For Google Cloud TPU:
-#   pip install torch-xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
-# For Colab TPU:
-#   pip install torch-xla
