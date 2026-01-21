@@ -91,17 +91,18 @@ class StorageManager:
     
     def _set_environment_variables(self):
         """Set HuggingFace environment variables for caching."""
-        # HF_HOME is the main cache directory
+        # HF_HOME is the main cache directory (controls all HF caching in v5+)
         os.environ['HF_HOME'] = str(self.models_dir)
         
-        # These are more specific cache locations
+        # HF_DATASETS_CACHE for datasets library
         os.environ['HF_DATASETS_CACHE'] = str(self.datasets_dir)
-        os.environ['TRANSFORMERS_CACHE'] = str(self.models_dir / 'transformers')
+        
+        # HUGGINGFACE_HUB_CACHE for hub downloads
         os.environ['HUGGINGFACE_HUB_CACHE'] = str(self.models_dir / 'hub')
         
         print(f"Set HF_HOME={os.environ['HF_HOME']}")
         print(f"Set HF_DATASETS_CACHE={os.environ['HF_DATASETS_CACHE']}")
-        print(f"Set TRANSFORMERS_CACHE={os.environ['TRANSFORMERS_CACHE']}")
+        print(f"Set HUGGINGFACE_HUB_CACHE={os.environ['HUGGINGFACE_HUB_CACHE']}")
     
     def get_model_cache_dir(self) -> Path:
         """Get the directory for caching models."""
