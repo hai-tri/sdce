@@ -1,145 +1,123 @@
 # Surrogate-Assisted Language Model Training Configuration
 # =========================================================
-# This configuration file demonstrates how to set up training
-# with a surrogate model providing guidance signals.
+# Pretraining TinyLlama 1.1B from scratch on OpenWebText
+# Optimized for RTX 4090 (24GB VRAM)
 
 # Base model configuration
 model:
-  name_or_path: "gpt2"  # HuggingFace model name or local path
-  dtype: "float16"      # float16, bfloat16, or float32
-  use_flash_attention: false
-  gradient_checkpointing: false
+  name_or_path: "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"  # Architecture source
+  dtype: "bfloat16"     # bfloat16 recommended for training stability
+  use_flash_attention: true   # Enable Flash Attention 2 for efficiency
+  gradient_checkpointing: true  # Enable to save VRAM
   trust_remote_code: false
+  
+  # IMPORTANT: Initialize weights randomly for pretraining from scratch
+  init_from_scratch: true
+  
+  # Optional: Override model config parameters
+  # custom_config:
+  #   hidden_size: 2048
+  #   num_hidden_layers: 22
+  #   num_attention_heads: 32
 
 # Surrogate model configuration
 surrogate:
   name_or_path: "Qwen/Qwen3-0.6B"  # Surrogate model for guidance
-  dtype: "float16"
+  dtype: "bfloat16"
   # Probability threshold for token selection (replaces fixed k)
   # Selects all surrogate tokens with probability > prob_threshold
-  # Example: 0.03 selects tokens with >3% probability
   prob_threshold: 0.03
   # Maximum tokens to consider per position (for memory efficiency)
-  # If more tokens exceed threshold, keeps top max_tokens by probability
   max_tokens: 100
   enabled: true     # Set to false to disable surrogate guidance
   trust_remote_code: true
-  # Surrogate loss weight scheduler (cosine decay, no warmup)
-  # weight = final + (initial - final) * 0.5 * (1 + cos(pi * step / total_steps))
+  # Surrogate loss weight scheduler (cosine decay)
   loss_weight_initial: 1.0  # Starting weight for surrogate loss
   loss_weight_final: 0.0    # Final weight (decays to this via cosine schedule)
 
 # Distillation configuration
-# =========================================================
-# Supports two distillation modes:
-#   - "surrogate": Custom surrogate-guided distillation (SDCE)
-#                  Uses perplexity-weighted tokens from surrogate model
-#   - "kd":        Standard knowledge distillation (Hinton et al., 2015)
-#                  Uses KL divergence between teacher/student distributions
-#   - "none":      No distillation, standard language modeling only
 distillation:
   mode: "surrogate"           # "surrogate", "kd", or "none"
   
   # Knowledge Distillation (KD) specific parameters
   # Only used when mode: "kd"
-  kd_temperature: 4.0         # Temperature for softening distributions (typical: 2-20)
-  kd_alpha: 0.5               # Weight for KD loss vs CE loss
-                              # alpha=1.0: only distillation loss
-                              # alpha=0.0: only cross-entropy loss
-                              # alpha=0.5: equal weighting (recommended)
+  kd_temperature: 4.0
+  kd_alpha: 0.5
   
   # Alpha scheduling (optional, for "kd" mode)
-  # If enabled, alpha decays from kd_alpha_initial to kd_alpha_final
-  kd_alpha_schedule: false    # Enable alpha scheduling
-  kd_alpha_initial: 0.9       # Initial alpha value
-  kd_alpha_final: 0.1         # Final alpha value (after cosine decay)
+  kd_alpha_schedule: false
+  kd_alpha_initial: 0.9
+  kd_alpha_final: 0.1
 
 # Data configuration
 data:
-  dataset_name: "wikitext"          # HuggingFace dataset name
-  dataset_config: "wikitext-2-raw-v1"  # Dataset configuration/subset
+  dataset_name: "openwebtext"       # OpenWebText dataset
+  dataset_config: null              # No config needed for openwebtext
   dataset_split: "train"
-  eval_split: "validation"
-  text_column: "text"               # Column containing text data
-  max_seq_length: 1024
-  preprocessing_num_workers: 4
-  # For custom datasets, use these instead:
-  # train_file: "/path/to/train.json"
-  # eval_file: "/path/to/eval.json"
+  # OpenWebText has no validation split, so we create one
+  eval_split: "validation"          # Will be auto-created
+  eval_ratio: 0.005                 # 0.5% of data for evaluation (standard ratio)
+  text_column: "text"
+  max_seq_length: 2048              # TinyLlama supports 2048 context
+  preprocessing_num_workers: 8      # Increase for faster preprocessing
 
 # Training configuration
 training:
-  output_dir: "./outputs"
-  num_epochs: 3
+  output_dir: "./outputs/tinyllama-1.1b-scratch-openwebtext"
+  num_epochs: 1                     # For pretraining, often 1-2 epochs over large data
+  
+  # Batch size tuned for 4090 (24GB) with gradient checkpointing
+  # Effective batch size = 4 * 16 = 64
   per_device_train_batch_size: 4
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 4
-  learning_rate: 1.0e-4
-  weight_decay: 0.01
-  warmup_ratio: 0.1
-  # warmup_steps: 100  # Use this instead of warmup_ratio if preferred
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 16
+  
+  learning_rate: 3.0e-4             # Higher LR typical for pretraining from scratch
+  weight_decay: 0.1                 # Higher weight decay for pretraining
+  warmup_ratio: 0.01                # ~1% warmup is common for pretraining
   max_grad_norm: 1.0
-  lr_scheduler_type: "cosine"  # cosine, linear, constant, etc.
+  lr_scheduler_type: "cosine"
   
-  # Device selection: "auto", "cuda", "mps", "tpu", "cpu"
-  device: "auto"
+  # Device selection
+  device: "auto"                    # Will auto-detect CUDA
   
-  # TPU-specific options (only used when device: "tpu")
-  tpu_cores: 1          # 1 for single core, 8 for TPU v3-8, etc.
-  tpu_metrics_debug: false
-  
-  # Mixed precision training
-  # - For GPU: "fp16" or "bf16" 
-  # - For TPU: "bf16" recommended (TPU v3+ native), "no" for float32
-  mixed_precision: "fp16"
+  # Mixed precision - bf16 recommended for training stability
+  mixed_precision: "bf16"
   
   # Logging and checkpointing
-  logging_steps: 10
-  eval_steps: 500
-  save_steps: 1000
-  save_total_limit: 3
+  logging_steps: 50
+  eval_steps: 2000                  # Evaluate every 2k steps
+  save_steps: 5000                  # Save checkpoint every 5k steps
+  save_total_limit: 3               # Keep only last 3 checkpoints
   
-  # Auxiliary loss (from PaLM)
-  use_z_loss: false
+  # Auxiliary loss (from PaLM) - helps with training stability
+  use_z_loss: true
   z_loss_multiplier: 1.0e-4
   
   # Random seed
-  seed: 67
-  
-  # Resume training
-  # resume_from_checkpoint: "./outputs/checkpoint-1000"
+  seed: 42
   
   # Weights & Biases logging
   wandb_project: "SDCE"
-  wandb_run_name: "gpt2-test-run-2"
+  wandb_run_name: "tinyllama-1.1b-scratch-openwebtext"
   wandb_entity: "nathanngtruong-university-of-california-berkeley"
 
-# Benchmark evaluation configuration (lm-evaluation-harness)
+# Benchmark evaluation configuration
 evaluation:
-  enabled: true                    # Enable/disable benchmark evaluation
-  eval_interval: 5              # Run benchmarks every N steps
+  enabled: true
+  eval_interval: 10000              # Run benchmarks every 10k steps
   
-  # Benchmark tasks to run
-  # Common options: "hellaswag", "arc_easy", "arc_challenge", "winogrande", 
-  # "piqa", "boolq", "lambada_openai", "mmlu", "truthfulqa_mc", "gsm8k"
   tasks:
     - "hellaswag"
-    - "arc_easy"
     - "piqa"
     - "winogrande"
     - "boolq"
-    - "mmlu"
-    - "gsm8k"
     - "arc_challenge"
-    - 'arc_easy'
-    - 'lambada_openai'
-    - 'agieval'
-    - 'openbookqa'
+    - "lambada_openai"
     
-  num_fewshot: 0                   # Number of few-shot examples (0 for zero-shot)
-  batch_size: 8                    # Batch size for evaluation
-  limit: null                      # Limit examples per task (null for all)
+  num_fewshot: 0
+  batch_size: 8
+  limit: null
   
-  # Logging options
-  log_individual_tasks: true       # Log score for each task separately
-  log_aggregate_score: true        # Log mean score across all tasks
+  log_individual_tasks: true
+  log_aggregate_score: true
