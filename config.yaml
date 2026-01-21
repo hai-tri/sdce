@@ -3,6 +3,23 @@
 # Pretraining TinyLlama 1.1B from scratch on OpenWebText
 # Optimized for RTX 4090 (24GB VRAM)
 
+# Storage configuration - specify where to store models, datasets, and outputs
+storage:
+  # Base directory for all storage (can be absolute or relative path)
+  base_dir: "./storage"
+  
+  # Subdirectories (relative to base_dir, or absolute paths)
+  models_dir: "models"              # Downloaded/cached models
+  datasets_dir: "datasets"          # Downloaded/cached datasets  
+  checkpoints_dir: "checkpoints"    # Training checkpoints
+  logs_dir: "logs"                  # Training logs
+  
+  # HuggingFace cache settings
+  use_hf_cache: false               # If true, use default HF cache instead of storage dirs
+  
+  # Set HF environment variables automatically
+  set_hf_env_vars: true             # Sets HF_HOME, HF_DATASETS_CACHE, TRANSFORMERS_CACHE
+
 # Base model configuration
 model:
   name_or_path: "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"  # Architecture source
@@ -99,7 +116,7 @@ training:
   
   # Weights & Biases logging
   wandb_project: "SDCE"
-  wandb_run_name: "tinyllama-1.1b-scratch-openwebtext"
+  wandb_run_name: "tinyllama-1.1b-openwebtext-baseline"
   wandb_entity: "nathanngtruong-university-of-california-berkeley"
 
 # Benchmark evaluation configuration
