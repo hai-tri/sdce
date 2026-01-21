@@ -1,554 +1,297 @@
 """
-Custom Cross-Entropy Loss with Surrogate Guidance and Knowledge Distillation
+Loss functions for surrogate-assisted language model training.
 
-This module provides loss functions for language model training with optional
-surrogate model guidance or standard knowledge distillation.
+Includes:
+- Cross-entropy loss (standard LM loss)
+- Surrogate-guided distillation loss (SDCE)
+- Knowledge distillation loss (Hinton et al., 2015)
+- Z-loss (PaLM auxiliary loss)
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional
 
 
-def cross_entropy_loss(
+def compute_cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
-    perp_values: Optional[torch.Tensor] = None,
-    perp_indices: Optional[torch.Tensor] = None,
-    lookup_surrogate_to_self_tokens: Optional[torch.Tensor] = None,
-    surrogate_weight: float = 1.0,
     ignore_index: int = -100,
-    reduction: str = "mean",
-    compute_z_loss: bool = False,
-    z_loss_multiplier: float = 1e-4,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> torch.Tensor:
     """
-    Cross-entropy loss with optional surrogate-guided auxiliary term.
-    
-    This function computes the standard cross-entropy loss and optionally adds
-    a surrogate-guided term that encourages the model to assign probability mass
-    to tokens that the surrogate model finds important.
+    Compute standard cross-entropy loss for language modeling.
     
     Args:
-        logits: Model output logits. Shape can be:
-            - (batch_size * seq_len, vocab_size) for flattened inputs, or
-            - (batch_size, seq_len, vocab_size) when using surrogate guidance
-        labels: Target labels. Shape matches logits batch dimensions.
-        perp_values: Perplexity values from surrogate model.
-            Shape: (batch_size, seq_len, max_tokens) where max_tokens is variable
-            based on probability threshold selection. Invalid entries are inf.
-        perp_indices: Token indices from surrogate model (in surrogate vocab).
-            Shape: (batch_size, seq_len, max_tokens). Invalid entries are -1.
-        lookup_surrogate_to_self_tokens: Lookup table mapping surrogate vocabulary
-            indices to base model vocabulary indices. Shape: (surrogate_vocab_size,)
-        surrogate_weight: Weight for the surrogate loss term (decays over training via cosine schedule)
-        ignore_index: Index to ignore in loss computation (typically -100 for padding)
-        reduction: How to reduce the loss - "mean", "sum", or "none"
-        compute_z_loss: Whether to compute auxiliary z-loss (from PaLM paper)
-        z_loss_multiplier: Coefficient for z-loss term
-        
+        logits: Model logits of shape (batch_size, seq_len, vocab_size)
+        labels: Target token IDs of shape (batch_size, seq_len)
+        ignore_index: Label index to ignore (padding tokens)
+    
     Returns:
-        Tuple of (loss, z_loss) where z_loss is None if compute_z_loss=False
-        
-    Example:
-        >>> # Standard cross-entropy (no surrogate)
-        >>> loss, _ = cross_entropy_loss(logits, labels)
-        
-        >>> # With surrogate guidance (threshold-based selection)
-        >>> loss, z_loss = cross_entropy_loss(
-        ...     logits, labels,
-        ...     perp_values=surr_perp_values,
-        ...     perp_indices=surr_perp_indices,
-        ...     lookup_surrogate_to_self_tokens=lookup_table,
-        ...     surrogate_weight=0.5,  # Decayed weight
-        ...     compute_z_loss=True
-        ... )
+        Scalar loss tensor
     """
-    device = logits.device
+    # Shift for causal LM: predict next token
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
     
-    if perp_indices is not None and lookup_surrogate_to_self_tokens is not None and surrogate_weight > 0:
-        # =====================================================================
-        # Surrogate-guided loss computation
-        # =====================================================================
-        
-        # Get dimensions
-        if logits.dim() == 2:
-            # Need to infer batch/seq dimensions from perp_indices
-            batch_size, seq_len, max_tokens = perp_indices.shape
-            vocab_size = logits.shape[-1]
-            logits = logits.view(batch_size, seq_len, vocab_size)
-            labels = labels.view(batch_size, seq_len)
-        else:
-            batch_size, seq_len, vocab_size = logits.shape
-            max_tokens = perp_indices.shape[-1]
-        
-        # Translate surrogate indices to base model vocabulary
-        # Handle invalid indices (-1) by clamping first
-        valid_indices_mask = perp_indices >= 0
-        safe_perp_indices = perp_indices.clamp(min=0)
-        translated_perp_indices = lookup_surrogate_to_self_tokens[safe_perp_indices]
-        translated_perp_indices[~valid_indices_mask] = -100  # Mark invalid
-        
-        # Create mask for valid translations (not -100 and within vocab)
-        valid_translation_mask = (translated_perp_indices >= 0) & (translated_perp_indices < vocab_size)
-        
-        # Clamp to valid range for gather operation (will be masked out anyway)
-        safe_translated_indices = translated_perp_indices.clamp(0, vocab_size - 1)
-        
-        # Compute log probabilities over the FULL vocabulary first, then gather
-        # This is the correct way - we need the actual model probabilities
-        log_probs = F.log_softmax(logits, dim=-1)
-        gathered_log_probs = torch.gather(log_probs, dim=2, index=safe_translated_indices)
-        gathered_nll = -gathered_log_probs  # Negative log likelihood
-        
-        # Identify rows where all perplexity values are inf (invalid positions)
-        # This happens when the label is -100 or no valid surrogate tokens exist
-        all_inf_mask = torch.isinf(perp_values).all(dim=-1)  # (batch_size, seq_len)
-        
-        # Create combined validity mask
-        # A position is valid if:
-        # 1. Not all perp values are inf
-        # 2. The translation is valid
-        # 3. The perp value itself is not inf (threshold-based selection)
-        row_valid_mask = ~all_inf_mask.unsqueeze(-1)  # (batch_size, seq_len, 1)
-        token_valid_mask = ~torch.isinf(perp_values)  # (batch_size, seq_len, max_tokens)
-        combined_mask = row_valid_mask & valid_translation_mask & token_valid_mask
-        
-        # Count valid surrogate entries for normalization
-        num_valid_surrogate = combined_mask.sum().item()
-        
-        # Compute softmax weights from perplexity
-        # Lower perplexity = higher weight (use negative perplexity in softmax)
-        # Mask invalid entries before computing softmax
-        masked_perp = perp_values.clone()
-        masked_perp[~combined_mask] = float('inf')
-        
-        # Handle edge case: if all values in a row are inf, softmax will produce NaN
-        # Replace rows where all values are inf with zeros (no surrogate contribution)
-        row_all_inf = torch.isinf(masked_perp).all(dim=-1, keepdim=True)
-        masked_perp = masked_perp.masked_fill(row_all_inf.expand_as(masked_perp), 0.0)
-        
-        # Softmax over the token dimension (the selected tokens)
-        softmax_weights = F.softmax(-masked_perp, dim=-1)
-        
-        # Zero out invalid positions
-        softmax_weights = softmax_weights * combined_mask.float()
-        
-        # Zero out NaN weights (safety check)
-        softmax_weights = torch.nan_to_num(softmax_weights, nan=0.0)
-        
-        # Compute weighted surrogate loss (scaled by surrogate_weight)
-        # Also zero out NaN in gathered_nll (from invalid indices)
-        gathered_nll_safe = torch.nan_to_num(gathered_nll, nan=0.0, posinf=0.0, neginf=0.0)
-        weighted_nll = gathered_nll_safe * softmax_weights
-        surrogate_loss_sum = surrogate_weight * weighted_nll.sum()
-        
-        # Compute standard cross-entropy loss
-        logits_flat = logits.view(-1, vocab_size)
-        labels_flat = labels.view(-1)
-        ce_loss_sum = F.cross_entropy(
-            logits_flat, labels_flat,
-            ignore_index=ignore_index,
-            reduction='sum'
-        )
-        
-        # Count valid labels for normalization
-        num_valid_labels = (labels_flat != ignore_index).sum().item()
-        
-        # Combine losses
-        total_loss = ce_loss_sum + surrogate_loss_sum
-        
-        if reduction == "mean":
-            # Normalize by total number of valid entries
-            total_count = num_valid_labels + num_valid_surrogate
-            loss = total_loss / (total_count + 1e-8)
-        elif reduction == "sum":
-            loss = total_loss
-        else:  # reduction == "none"
-            # Return per-position losses
-            ce_per_position = F.cross_entropy(
-                logits_flat, labels_flat,
-                ignore_index=ignore_index,
-                reduction='none'
-            ).view(batch_size, seq_len)
-            surrogate_per_position = weighted_nll.sum(dim=-1)
-            loss = ce_per_position + surrogate_per_position
-            
-    else:
-        # =====================================================================
-        # Standard cross-entropy loss (no surrogate guidance)
-        # =====================================================================
-        loss = F.cross_entropy(
-            logits, labels,
-            ignore_index=ignore_index,
-            reduction=reduction
-        )
+    # Flatten for loss computation
+    vocab_size = shift_logits.size(-1)
+    shift_logits = shift_logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
     
-    # =========================================================================
-    # Optional Z-loss computation (from PaLM paper)
-    # =========================================================================
-    z_loss = None
-    if compute_z_loss:
-        # Z-loss penalizes large logits to stabilize training
-        # z = logsumexp(logits) => z_loss = z^2
-        if logits.dim() == 2:
-            z_squared = logits.logsumexp(dim=-1).pow(2)
-            label_mask = (labels != ignore_index).float()
-        else:
-            z_squared = logits.view(-1, logits.size(-1)).logsumexp(dim=-1).pow(2)
-            label_mask = (labels.view(-1) != ignore_index).float()
-        
-        if reduction == "mean":
-            z_loss = z_loss_multiplier * (z_squared * label_mask).sum() / (label_mask.sum() + 1e-8)
-        elif reduction == "sum":
-            z_loss = z_loss_multiplier * (z_squared * label_mask).sum()
-        else:  # reduction == "none"
-            z_loss = z_loss_multiplier * z_squared
+    loss = F.cross_entropy(
+        shift_logits,
+        shift_labels,
+        ignore_index=ignore_index,
+        reduction="mean",
+    )
     
-    return loss, z_loss
+    return loss
 
 
-def knowledge_distillation_loss(
+def compute_surrogate_distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    prob_threshold: float = 0.03,
+    max_tokens: int = 100,
+    ignore_index: int = -100,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute surrogate-guided distillation cross-entropy (SDCE) loss.
+    
+    This loss focuses the student model on tokens that the surrogate/teacher
+    model considers probable, weighted by the surrogate's confidence.
+    
+    Args:
+        student_logits: Student model logits (batch, seq_len, vocab_size)
+        teacher_logits: Teacher/surrogate model logits (batch, seq_len, vocab_size)
+        labels: Ground truth labels (batch, seq_len)
+        prob_threshold: Minimum probability threshold for token selection
+        max_tokens: Maximum number of tokens to consider per position
+        ignore_index: Label index to ignore
+        temperature: Temperature for softening distributions
+    
+    Returns:
+        Scalar loss tensor
+    """
+    # Shift for causal LM
+    student_logits = student_logits[..., :-1, :].contiguous()
+    teacher_logits = teacher_logits[..., :-1, :].contiguous()
+    labels = labels[..., 1:].contiguous()
+    
+    batch_size, seq_len, vocab_size = student_logits.shape
+    
+    # Get teacher probabilities
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+    
+    # Create mask for valid positions (not padding)
+    valid_mask = (labels != ignore_index).float()
+    
+    # Get student log probabilities
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    
+    # For each position, compute loss weighted by teacher probabilities
+    # Only consider tokens above threshold
+    
+    # Create threshold mask
+    threshold_mask = (teacher_probs > prob_threshold).float()
+    
+    # Limit to top-k tokens if needed (for memory efficiency)
+    if max_tokens < vocab_size:
+        # Get top-k teacher probs
+        top_probs, top_indices = torch.topk(teacher_probs, k=max_tokens, dim=-1)
+        
+        # Create sparse mask
+        topk_mask = torch.zeros_like(teacher_probs)
+        topk_mask.scatter_(-1, top_indices, 1.0)
+        
+        # Combine with threshold mask
+        threshold_mask = threshold_mask * topk_mask
+    
+    # Compute weighted cross-entropy
+    # Loss = -sum(teacher_prob * student_log_prob) for selected tokens
+    weighted_loss = -(teacher_probs * student_log_probs * threshold_mask).sum(dim=-1)
+    
+    # Normalize by number of selected tokens per position (avoid division by zero)
+    num_selected = threshold_mask.sum(dim=-1).clamp(min=1e-8)
+    weighted_loss = weighted_loss / num_selected
+    
+    # Apply valid mask and compute mean
+    weighted_loss = weighted_loss * valid_mask
+    loss = weighted_loss.sum() / valid_mask.sum().clamp(min=1e-8)
+    
+    return loss
+
+
+def compute_kd_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     labels: torch.Tensor,
     temperature: float = 4.0,
-    alpha: float = 0.5,
     ignore_index: int = -100,
-    reduction: str = "mean",
-    compute_z_loss: bool = False,
-    z_loss_multiplier: float = 1e-4,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict]:
+) -> torch.Tensor:
     """
-    Standard Knowledge Distillation loss (Hinton et al., 2015).
+    Compute standard knowledge distillation loss (Hinton et al., 2015).
     
-    Combines soft target loss (KL divergence between teacher and student distributions)
-    with hard target loss (cross-entropy with ground truth labels).
-    
-    L_KD = alpha * T^2 * KL(softmax(z_t/T) || softmax(z_s/T)) + (1-alpha) * L_CE
+    Uses KL divergence between softened teacher and student distributions.
     
     Args:
-        student_logits: Student model logits. Shape: (batch_size, seq_len, vocab_size) or
-            (batch_size * seq_len, vocab_size)
-        teacher_logits: Teacher model logits. Shape must match student_logits.
-        labels: Ground truth labels. Shape: (batch_size, seq_len) or (batch_size * seq_len,)
-        temperature: Temperature for softening distributions. Higher = softer.
-            Typical values: 2-20. Default: 4.0
-        alpha: Weight for distillation loss vs. hard label loss.
-            alpha=1.0 means only distillation, alpha=0.0 means only CE.
-            Default: 0.5
-        ignore_index: Index to ignore in loss computation (typically -100 for padding)
-        reduction: How to reduce the loss - "mean", "sum", or "none"
-        compute_z_loss: Whether to compute auxiliary z-loss (from PaLM paper)
-        z_loss_multiplier: Coefficient for z-loss term
-        
+        student_logits: Student model logits (batch, seq_len, vocab_size)
+        teacher_logits: Teacher model logits (batch, seq_len, vocab_size)
+        labels: Ground truth labels (for masking padding)
+        temperature: Temperature for softening distributions
+        ignore_index: Label index to ignore
+    
     Returns:
-        Tuple of (total_loss, z_loss, metrics_dict) where:
-        - total_loss: Combined KD loss
-        - z_loss: Optional z-loss (None if compute_z_loss=False)
-        - metrics_dict: Dictionary with 'kd_loss' and 'ce_loss' for logging
-        
-    Example:
-        >>> loss, z_loss, metrics = knowledge_distillation_loss(
-        ...     student_logits=student_out.logits,
-        ...     teacher_logits=teacher_out.logits,
-        ...     labels=labels,
-        ...     temperature=4.0,
-        ...     alpha=0.5
-        ... )
+        Scalar loss tensor
     """
-    device = student_logits.device
+    # Shift for causal LM
+    student_logits = student_logits[..., :-1, :].contiguous()
+    teacher_logits = teacher_logits[..., :-1, :].contiguous()
+    labels = labels[..., 1:].contiguous()
     
-    # Ensure consistent shapes
-    if student_logits.dim() == 3:
-        batch_size, seq_len, vocab_size = student_logits.shape
-        student_logits_flat = student_logits.view(-1, vocab_size)
-        teacher_logits_flat = teacher_logits.view(-1, vocab_size)
-        labels_flat = labels.view(-1)
+    # Create mask for valid positions
+    valid_mask = (labels != ignore_index).float()
+    
+    # Compute softened distributions
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+    
+    # KL divergence: sum(p * log(p/q)) = sum(p * log(p)) - sum(p * log(q))
+    # Since we want gradient to flow to student only:
+    # KL = -sum(teacher_probs * student_log_probs) + const
+    kl_div = F.kl_div(
+        student_log_probs,
+        teacher_probs,
+        reduction="none",
+    ).sum(dim=-1)
+    
+    # Apply mask and compute mean
+    kl_div = kl_div * valid_mask
+    
+    # Scale by T^2 as per original KD paper
+    loss = (temperature ** 2) * kl_div.sum() / valid_mask.sum().clamp(min=1e-8)
+    
+    return loss
+
+
+def compute_z_loss(
+    logits: torch.Tensor,
+    labels: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """
+    Compute z-loss (auxiliary loss from PaLM).
+    
+    The z-loss encourages the logits to stay small, which helps
+    with training stability, especially for large models.
+    
+    z_loss = mean(log(sum(exp(logits))))^2
+    
+    Args:
+        logits: Model logits (batch, seq_len, vocab_size)
+        labels: Optional labels for masking (if provided)
+        ignore_index: Label index to ignore
+    
+    Returns:
+        Scalar loss tensor
+    """
+    # Shift logits for causal LM
+    shift_logits = logits[..., :-1, :].contiguous()
+    
+    # Compute log-sum-exp (numerically stable)
+    log_z = torch.logsumexp(shift_logits, dim=-1)
+    
+    # Square it
+    z_loss = log_z ** 2
+    
+    # Apply mask if labels provided
+    if labels is not None:
+        shift_labels = labels[..., 1:].contiguous()
+        valid_mask = (shift_labels != ignore_index).float()
+        z_loss = z_loss * valid_mask
+        z_loss = z_loss.sum() / valid_mask.sum().clamp(min=1e-8)
     else:
-        student_logits_flat = student_logits
-        teacher_logits_flat = teacher_logits
-        labels_flat = labels
-        vocab_size = student_logits.shape[-1]
+        z_loss = z_loss.mean()
     
-    # Create mask for valid positions (not padding)
-    valid_mask = (labels_flat != ignore_index)
-    num_valid = valid_mask.sum().item()
+    return z_loss
+
+
+def compute_combined_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: Optional[torch.Tensor],
+    labels: torch.Tensor,
+    distillation_mode: str = "surrogate",
+    distillation_weight: float = 0.5,
+    kd_temperature: float = 4.0,
+    prob_threshold: float = 0.03,
+    max_tokens: int = 100,
+    use_z_loss: bool = False,
+    z_loss_weight: float = 1e-4,
+    ignore_index: int = -100,
+) -> dict:
+    """
+    Compute combined loss with optional distillation and z-loss.
     
-    if num_valid == 0:
-        # No valid tokens, return zero loss
-        zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        return zero_loss, None, {'kd_loss': 0.0, 'ce_loss': 0.0}
+    Args:
+        student_logits: Student model logits
+        teacher_logits: Teacher model logits (optional)
+        labels: Ground truth labels
+        distillation_mode: "surrogate", "kd", or "none"
+        distillation_weight: Weight for distillation loss
+        kd_temperature: Temperature for KD
+        prob_threshold: Probability threshold for surrogate
+        max_tokens: Max tokens for surrogate
+        use_z_loss: Whether to add z-loss
+        z_loss_weight: Weight for z-loss
+        ignore_index: Label index to ignore
     
-    # =========================================================================
-    # Soft target loss (KL Divergence)
-    # =========================================================================
-    # Soften distributions with temperature
-    student_soft = F.log_softmax(student_logits_flat / temperature, dim=-1)
-    teacher_soft = F.softmax(teacher_logits_flat / temperature, dim=-1)
+    Returns:
+        Dictionary with total_loss and individual loss components
+    """
+    # Base cross-entropy loss
+    ce_loss = compute_cross_entropy_loss(student_logits, labels, ignore_index)
+    total_loss = ce_loss
     
-    # KL divergence: sum over vocab, then handle reduction
-    # KL(P || Q) = sum(P * (log(P) - log(Q)))
-    # Using F.kl_div with log_target=False: expects input=log(Q), target=P
-    kl_div_per_token = F.kl_div(
-        student_soft,
-        teacher_soft,
-        reduction='none',
-        log_target=False
-    ).sum(dim=-1)  # Sum over vocabulary
-    
-    # Mask out padding positions
-    kl_div_per_token = kl_div_per_token * valid_mask.float()
-    
-    # Scale by T^2 as per Hinton et al.
-    kl_div_scaled = kl_div_per_token * (temperature ** 2)
-    
-    # =========================================================================
-    # Hard target loss (Cross-Entropy)
-    # =========================================================================
-    ce_loss_per_token = F.cross_entropy(
-        student_logits_flat,
-        labels_flat,
-        ignore_index=ignore_index,
-        reduction='none'
-    )
-    
-    # =========================================================================
-    # Combine losses
-    # =========================================================================
-    if reduction == "mean":
-        kd_loss = kl_div_scaled.sum() / (num_valid + 1e-8)
-        ce_loss = ce_loss_per_token.sum() / (num_valid + 1e-8)
-        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
-    elif reduction == "sum":
-        kd_loss = kl_div_scaled.sum()
-        ce_loss = ce_loss_per_token.sum()
-        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
-    else:  # reduction == "none"
-        kd_loss = kl_div_scaled
-        ce_loss = ce_loss_per_token
-        total_loss = alpha * kd_loss + (1 - alpha) * ce_loss
-    
-    # =========================================================================
-    # Optional Z-loss computation (from PaLM paper)
-    # =========================================================================
-    z_loss = None
-    if compute_z_loss:
-        z_squared = student_logits_flat.logsumexp(dim=-1).pow(2)
-        
-        if reduction == "mean":
-            z_loss = z_loss_multiplier * (z_squared * valid_mask.float()).sum() / (num_valid + 1e-8)
-        elif reduction == "sum":
-            z_loss = z_loss_multiplier * (z_squared * valid_mask.float()).sum()
-        else:
-            z_loss = z_loss_multiplier * z_squared
-    
-    # Metrics for logging
-    metrics = {
-        'kd_loss': kd_loss.item() if reduction != "none" else kd_loss.mean().item(),
-        'ce_loss': ce_loss.item() if reduction != "none" else ce_loss.mean().item(),
+    result = {
+        "total_loss": total_loss,
+        "ce_loss": ce_loss,
     }
     
-    return total_loss, z_loss, metrics
-
-
-def compute_perplexity_guidance(
-    surrogate_logits: torch.Tensor,
-    labels: torch.Tensor,
-    lookup_base_to_surrogate: torch.Tensor,
-    permitted_surrogate_ids: torch.Tensor,
-    prob_threshold: float,
-    max_tokens: int = 100,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute probability threshold-based guidance from surrogate model.
-    
-    Instead of selecting a fixed top-k tokens, this function selects all tokens
-    whose probability exceeds the specified threshold.
-    
-    Args:
-        surrogate_logits: Logits from surrogate model. Shape: (batch, seq_len, surrogate_vocab)
-        labels: Target labels in base model vocabulary. Shape: (batch, seq_len)
-        lookup_base_to_surrogate: Lookup table from base vocab to surrogate vocab
-        permitted_surrogate_ids: Surrogate token IDs that are in vocabulary intersection
-        prob_threshold: Probability threshold for token selection (e.g., 0.03 selects
-            tokens with probability > 0.03)
-        max_tokens: Maximum number of tokens to select per position (for memory efficiency).
-            Positions with more tokens above threshold will keep only the top max_tokens.
-        
-    Returns:
-        Tuple of:
-        - perp_values: Perplexity values for selected tokens. Shape: (batch, seq_len, max_tokens)
-            Invalid/padded entries are set to inf.
-        - perp_indices: Surrogate vocab indices for selected tokens. Shape: (batch, seq_len, max_tokens)
-            Invalid/padded entries are set to -1.
-    """
-    device = surrogate_logits.device
-    batch_size, seq_len, vocab_size = surrogate_logits.shape
-    
-    # Compute probabilities from logits
-    surrogate_probs = F.softmax(surrogate_logits, dim=-1)
-    
-    # Compute perplexity (reciprocal of probability)
-    surrogate_perp = torch.reciprocal(surrogate_probs + 1e-8)
-    
-    # Mask tokens not in vocabulary intersection
-    vocab_indices = torch.arange(vocab_size, device=device)
-    not_in_intersection = ~torch.isin(vocab_indices, permitted_surrogate_ids)
-    surrogate_probs[:, :, not_in_intersection] = 0.0
-    surrogate_perp[:, :, not_in_intersection] = float('inf')
-    
-    # Mask positions where labels are invalid
-    invalid_label_mask = (labels == -100).unsqueeze(-1)
-    surrogate_probs = surrogate_probs.masked_fill(invalid_label_mask, 0.0)
-    surrogate_perp = surrogate_perp.masked_fill(invalid_label_mask, float('inf'))
-    
-    # Translate labels to surrogate vocab and mask them out
-    # (we don't want to include the actual label in selection)
-    safe_labels = labels.clone()
-    safe_labels[labels == -100] = 0
-    translated_labels = lookup_base_to_surrogate[safe_labels]
-    
-    valid_translation_mask = translated_labels != -100
-    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
-    seq_idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    
-    # Create safe indices for scatter
-    safe_translated = translated_labels.clone()
-    safe_translated[~valid_translation_mask] = 0
-    
-    # Mask out the actual labels (set their probability to 0)
-    surrogate_probs[batch_idx, seq_idx, safe_translated] = 0.0
-    surrogate_perp[batch_idx, seq_idx, safe_translated] = float('inf')
-    
-    # Create mask for tokens above probability threshold
-    above_threshold_mask = surrogate_probs > prob_threshold
-    
-    # Set perplexity to inf for tokens below threshold
-    surrogate_perp[~above_threshold_mask] = float('inf')
-    
-    # Get the top max_tokens lowest perplexity tokens (these are the ones above threshold)
-    # Using topk with largest=False gives us the smallest perplexities (highest probs)
-    topk_result = torch.topk(surrogate_perp, k=max_tokens, largest=False, sorted=True, dim=-1)
-    
-    perp_values = topk_result.values  # (batch, seq_len, max_tokens)
-    perp_indices = topk_result.indices  # (batch, seq_len, max_tokens)
-    
-    # Mark indices as invalid (-1) where perplexity is inf (below threshold or invalid)
-    invalid_mask = torch.isinf(perp_values)
-    perp_indices = perp_indices.masked_fill(invalid_mask, -1)
-    
-    return perp_values, perp_indices
-
-
-class SurrogateCrossEntropyLoss(torch.nn.Module):
-    """
-    PyTorch module wrapper for surrogate-guided cross-entropy loss.
-    
-    Example:
-        >>> criterion = SurrogateCrossEntropyLoss(
-        ...     lookup_table=lookup_surrogate_to_base,
-        ...     compute_z_loss=True
-        ... )
-        >>> loss, z_loss = criterion(logits, labels, perp_values, perp_indices)
-    """
-    
-    def __init__(
-        self,
-        lookup_table: Optional[torch.Tensor] = None,
-        ignore_index: int = -100,
-        reduction: str = "mean",
-        compute_z_loss: bool = False,
-        z_loss_multiplier: float = 1e-4,
-    ):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-        self.compute_z_loss = compute_z_loss
-        self.z_loss_multiplier = z_loss_multiplier
-        
-        if lookup_table is not None:
-            self.register_buffer('lookup_table', lookup_table)
-        else:
-            self.lookup_table = None
-    
-    def forward(
-        self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        perp_values: Optional[torch.Tensor] = None,
-        perp_indices: Optional[torch.Tensor] = None,
-        surrogate_weight: float = 1.0,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return cross_entropy_loss(
-            logits=logits,
-            labels=labels,
-            perp_values=perp_values,
-            perp_indices=perp_indices,
-            lookup_surrogate_to_self_tokens=self.lookup_table,
-            surrogate_weight=surrogate_weight,
-            ignore_index=self.ignore_index,
-            reduction=self.reduction,
-            compute_z_loss=self.compute_z_loss,
-            z_loss_multiplier=self.z_loss_multiplier,
-        )
-
-
-class KnowledgeDistillationLoss(torch.nn.Module):
-    """
-    PyTorch module wrapper for knowledge distillation loss.
-    
-    Example:
-        >>> criterion = KnowledgeDistillationLoss(
-        ...     temperature=4.0,
-        ...     alpha=0.5,
-        ...     compute_z_loss=True
-        ... )
-        >>> loss, z_loss, metrics = criterion(student_logits, teacher_logits, labels)
-    """
-    
-    def __init__(
-        self,
-        temperature: float = 4.0,
-        alpha: float = 0.5,
-        ignore_index: int = -100,
-        reduction: str = "mean",
-        compute_z_loss: bool = False,
-        z_loss_multiplier: float = 1e-4,
-    ):
-        super().__init__()
-        self.temperature = temperature
-        self.alpha = alpha
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-        self.compute_z_loss = compute_z_loss
-        self.z_loss_multiplier = z_loss_multiplier
-    
-    def forward(
-        self,
-        student_logits: torch.Tensor,
-        teacher_logits: torch.Tensor,
-        labels: torch.Tensor,
-        alpha: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict]:
-        """
-        Args:
-            student_logits: Student model logits
-            teacher_logits: Teacher model logits
-            labels: Ground truth labels
-            alpha: Override alpha value (for scheduled alpha)
+    # Distillation loss
+    if teacher_logits is not None and distillation_mode != "none":
+        if distillation_mode == "surrogate":
+            distill_loss = compute_surrogate_distillation_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                labels=labels,
+                prob_threshold=prob_threshold,
+                max_tokens=max_tokens,
+                ignore_index=ignore_index,
+            )
+            total_loss = ce_loss + distillation_weight * distill_loss
+            result["surrogate_loss"] = distill_loss
             
-        Returns:
-            Tuple of (loss, z_loss, metrics_dict)
-        """
-        return knowledge_distillation_loss(
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            labels=labels,
-            temperature=self.temperature,
-            alpha=alpha if alpha is not None else self.alpha,
-            ignore_index=self.ignore_index,
-            reduction=self.reduction,
-            compute_z_loss=self.compute_z_loss,
-            z_loss_multiplier=self.z_loss_multiplier,
-        )
+        elif distillation_mode == "kd":
+            distill_loss = compute_kd_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                labels=labels,
+                temperature=kd_temperature,
+                ignore_index=ignore_index,
+            )
+            total_loss = (1 - distillation_weight) * ce_loss + distillation_weight * distill_loss
+            result["kd_loss"] = distill_loss
+        
+        result["total_loss"] = total_loss
+    
+    # Z-loss
+    if use_z_loss:
+        z_loss = compute_z_loss(student_logits, labels, ignore_index)
+        total_loss = total_loss + z_loss_weight * z_loss
+        result["z_loss"] = z_loss
+        result["total_loss"] = total_loss
+    
+    return result
