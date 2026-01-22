@@ -1,264 +1,55 @@
-# Multi-Label LLM Pretraining With A Smaller “Teacher” Model
+# Surrogate-Assisted Language Model Training
 
-
-Standard causal language model pretraining uses a single-label cross-entropy objective that ignores the existence of multiple valid next-token continuations, resulting in sample inefficiency. In this work, we introduce a multi-label pretraining objective that modifies the loss to append a small set of context-conforming auxiliary tokens selected by a lightweight surrogate language model. Distinct from existing knowledge distillation methods, the surrogate is used only for token selection rather than full distribution matching. We leveraged allenai.org’s OLMo 2 1B training repository, and we found that this method achieves comparable benchmark performance with significantly fewer training tokens and optimization steps. The results demonstrate that fixing this token-level label inefficiency can effectively lessen training times and has real-world applications towards nontrivial cost savings.
-
-This repository provides a general version of the experiment mentioned above. Here, it is possible to define the student and surrogate models while logging statistics with wandb.
-
-### Key Features
-
-- **Flexible Model Selection**: Use any HuggingFace-compatible model as base or surrogate
-- **Vocabulary Alignment**: Automatic handling of vocabulary differences between tokenizers
-- **Mixed Precision Training**: Support for FP16 and BF16 training
-- **Distributed Training**: DDP support for multi-GPU training
-- **Configurable via YAML or CLI**: Easy configuration through config files or command line
-- **Weights & Biases Integration**: Optional experiment tracking
-- **Checkpoint Management**: Automatic checkpoint saving and cleanup
-
-## Installation
-
-```bash
-# Clone or download this repository
-cd sdce
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Optional: Install flash-attention for faster training
-pip install flash-attn --no-build-isolation
-```
+Train language models from scratch with optional surrogate model guidance (SDCE - Surrogate-guided Distillation Cross-Entropy).
 
 ## Quick Start
 
-### Using Command Line Arguments
-
 ```bash
-# Basic training with default settings
-python train.py \
-    --base_model gpt2 \
-    --surrogate_model Qwen/Qwen3-0.6B \
-    --dataset wikitext \
-    --dataset_config wikitext-2-raw-v1 \
-    --output_dir ./outputs \
-    --batch_size 4 \
-    --learning_rate 1e-4
+# Install dependencies
+pip install -r requirements.txt
 
-# Training without surrogate guidance (standard training)
-python train.py \
-    --base_model gpt2 \
-    --dataset wikitext \
-    --dataset_config wikitext-2-raw-v1 \
-    --no_surrogate \
-    --output_dir ./outputs
-
-# With custom dataset files
-python train.py \
-    --base_model meta-llama/Llama-2-7b-hf \
-    --surrogate_model Qwen/Qwen3-0.6B \
-    --train_file /path/to/train.json \
-    --eval_file /path/to/eval.json \
-    --text_column text \
-    --output_dir ./outputs
-```
-
-### Using Configuration File
-
-```bash
-# Train using config file
+# Single GPU
 python train.py --config config.yaml
 
-# Override specific settings
-python train.py --config config.yaml --learning_rate 5e-5 --batch_size 8
+# Multi-GPU (4 GPUs)
+torchrun --nproc_per_node=4 train.py --config config.yaml
+
+# Apple Silicon
+python train.py --config config.yaml --device mps
+
+# TPU
+USE_TPU=1 python train.py --config config.yaml
 ```
 
-## Training Approaches
+## Supported Devices
 
-### 1. Standard Training (No Surrogate)
+| Device | Command |
+|--------|---------|
+| CUDA (single) | `python train.py --config config.yaml` |
+| CUDA (multi) | `torchrun --nproc_per_node=N train.py --config config.yaml` |
+| MPS | `python train.py --config config.yaml --device mps` |
+| TPU | `USE_TPU=1 python train.py --config config.yaml` |
+| CPU | `python train.py --config config.yaml --device cpu` |
 
-For baseline comparison or when you don't need surrogate guidance:
+## Key Features
 
-```bash
-python train.py \
-    --base_model gpt2 \
-    --dataset wikitext \
-    --no_surrogate
-```
+- **SDCE Loss**: Surrogate model guides training via soft token targets
+- **Mixed Precision**: bf16/fp16 with automatic device adaptation
+- **Flash Attention 2**: Auto-enabled on supported GPUs
+- **Z-Loss**: PaLM-style auxiliary loss for stability
+- **Distributed**: Full DDP support via torchrun
 
-### 2. Surrogate-Guided Training
+## Configuration
 
-The main training mode with surrogate model providing token guidance:
+Edit `config.yaml` to customize:
+- `model.name_or_path`: Base model architecture
+- `sdce.mode`: `"surrogate"`, `"kd"`, or `"none"` (controls surrogate usage)
+- `surrogate.prob_threshold`: Token selection threshold (default: 0.03)
+- `training.mixed_precision`: `"bf16"`, `"fp16"`, or `"fp32"`
 
-```bash
-python train.py \
-    --base_model gpt2 \
-    --surrogate_model Qwen/Qwen3-0.6B \
-    --surrogate_k 6 \
-    --dataset wikitext
-```
+## Files
 
-### 3. Distributed Training
-
-For multi-GPU training:
-
-```bash
-torchrun --nproc_per_node=4 train.py \
-    --config config.yaml
-```
-
-## How the Surrogate Loss Works
-
-The surrogate-assisted loss combines two components:
-
-1. **Standard Cross-Entropy Loss**: 
-   $$\mathcal{L}_{CE} = -\sum_{i} \log p(y_i | x_{<i})$$
-
-2. **Surrogate-Guided Loss**:
-   - The surrogate model computes perplexity for each token position
-   - Top-k tokens with lowest perplexity (highest confidence) are selected
-   - The actual target token is **masked out** from consideration
-   - These tokens are weighted by softmax of negative perplexity
-   - The base model is encouraged to also assign probability to these tokens
-
-The combined loss:
-$$\mathcal{L} = \mathcal{L}_{CE} + \lambda(t) \cdot \mathcal{L}_{surrogate}$$
-
-Where:
-$$\mathcal{L}_{surrogate} = \sum_{i} \sum_{j \in \text{top-k}} w_{i,j} \cdot (-\log p_{base}(t_j | x_{<i}))$$
-
-And $w_{i,j}$ is the softmax-normalized weight based on surrogate perplexity.
-
-### Surrogate Loss Weight Scheduler
-
-The surrogate loss weight $\lambda(t)$ follows a **cosine decay schedule** (without warmup):
-
-$$\lambda(t) = \lambda_{final} + \frac{1}{2}(\lambda_{initial} - \lambda_{final})\left(1 + \cos\left(\frac{\pi \cdot t}{T}\right)\right)$$
-
-Where:
-- $t$ is the current training step
-- $T$ is the total number of training steps
-- $\lambda_{initial}$ is `loss_weight_initial` (default: 1.0)
-- $\lambda_{final}$ is `loss_weight_final` (default: 0.0)
-
-This means the surrogate guidance is strongest at the beginning of training and gradually fades out, allowing the model to learn from the surrogate early on while eventually relying on standard cross-entropy loss.
-
-Configure via CLI:
-```bash
-python train.py \
-    --surrogate_loss_weight_initial 1.0 \
-    --surrogate_loss_weight_final 0.0
-```
-
-Or in config.yaml:
-```yaml
-surrogate:
-  loss_weight_initial: 1.0
-  loss_weight_final: 0.0
-```
-
-### Learning Rate Scheduler
-
-The learning rate uses a **cosine annealing schedule with warmup** (via HuggingFace's `get_scheduler`):
-- Warmup: Linear warmup from 0 to `learning_rate` over `warmup_steps` (or `warmup_ratio * total_steps`)
-- Decay: Cosine decay from `learning_rate` to 0 over the remaining steps
-
-## Vocabulary Alignment
-
-The framework automatically handles vocabulary differences between base and surrogate models:
-
-1. **Intersection Computation**: Finds tokens present in both vocabularies
-2. **Lookup Tables**: Creates bidirectional mappings between token IDs
-3. **Masking**: Tokens not in intersection are masked in surrogate outputs
-
-## Custom Datasets
-
-### JSON Format
-
-```json
-[
-    {"text": "First document text..."},
-    {"text": "Second document text..."}
-]
-```
-
-### Plain Text Format
-
-One document per line in a `.txt` file.
-
-### Usage
-
-```bash
-python train.py \
-    --train_file /path/to/train.json \
-    --eval_file /path/to/eval.json \
-    --text_column text
-```
-
-## Monitoring and Logging
-
-### Weights & Biases
-
-```bash
-python train.py \
-    --config config.yaml \
-    --wandb_project my-project \
-    --wandb_run_name experiment-1
-```
-
-### Console Logging
-
-Training progress is logged to console with:
-- Loss and perplexity
-- Learning rate
-- Gradient norm
-- Tokens per second
-
-## Checkpointing
-
-Checkpoints are saved automatically and include:
-- Model weights
-- Optimizer state
-- Scheduler state
-- RNG states for reproducibility
-- Training configuration
-
-Resume training:
-```bash
-python train.py --config config.yaml --resume_from_checkpoint ./outputs/checkpoint-1000
-```
-
-## Tips and Best Practices
-
-1. **Choosing Surrogate Model**: Select a surrogate model that is:
-   - Smaller than your base model (for efficiency)
-   - Has reasonable vocabulary overlap with your base tokenizer
-   - Pre-trained on similar data distributions
-
-2. **Setting k**: Start with `k=6` and adjust based on:
-   - Higher k: More diverse guidance, slower training
-   - Lower k: Focused guidance, faster training
-
-3. **Memory Optimization**:
-   - Use gradient checkpointing for large models
-   - Reduce batch size and increase gradient accumulation
-   - Use FP16/BF16 mixed precision
-
-4. **Vocabulary Overlap**: Check the logged "vocabulary intersection size" - if it's too small, the surrogate guidance may be limited.
-
-## Troubleshooting
-
-### CUDA Out of Memory
-- Reduce `per_device_train_batch_size`
-- Enable `gradient_checkpointing`
-- Use `mixed_precision: "fp16"`
-
-### Slow Training
-- Increase `gradient_accumulation_steps` instead of batch size
-- Use `num_workers > 0` in data loading
-- Consider using Flash Attention
-
-### Poor Results
-- Verify vocabulary overlap is sufficient
-- Try adjusting `k` parameter
-- Check learning rate and warmup settings
-
-
+- `train.py` - Main training script
+- `losses.py` - Loss functions (CE, SDCE, KD, Z-loss)
+- `config.yaml` - Training configuration
+- `requirements.txt` - Dependencies
