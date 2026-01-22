@@ -1,4 +1,4 @@
-# Surrogate-Assisted Language Model Training
+# SDCE
 
 Train language models from scratch with optional surrogate model guidance (SDCE - Surrogate-guided Distillation Cross-Entropy).
 
