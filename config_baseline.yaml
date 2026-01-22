@@ -1,7 +1,29 @@
 # Surrogate-Assisted Language Model Training Configuration
 # =========================================================
 # Pretraining TinyLlama 1.1B from scratch on OpenWebText
-# Optimized for RTX 4090 (24GB VRAM)
+# Supports: CUDA (single/multi-GPU), MPS (Apple Silicon), TPU, and CPU
+#
+# =============================================================================
+# DISTRIBUTED TRAINING GUIDE
+# =============================================================================
+#
+# Single GPU / CPU / MPS:
+#   python train.py --config config.yaml
+#
+# Multi-GPU with torchrun (RECOMMENDED):
+#   torchrun --nproc_per_node=4 train.py --config config.yaml
+#   torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=<MASTER_IP> --master_port=29500 train.py --config config.yaml
+#
+# Multi-GPU with torch.distributed.launch (LEGACY):
+#   python -m torch.distributed.launch --nproc_per_node=4 train.py --config config.yaml
+#
+# TPU:
+#   USE_TPU=1 python train.py --config config.yaml --tpu-cores 8
+#
+# SLURM cluster example:
+#   srun --ntasks=8 --gpus-per-task=1 torchrun --nproc_per_node=1 train.py --config config.yaml
+#
+# =============================================================================
 
 # Storage configuration - specify where to store models, datasets, and outputs
 storage:
@@ -23,8 +45,8 @@ storage:
 # Base model configuration
 model:
   name_or_path: "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"  # Architecture source
-  dtype: "bfloat16"     # bfloat16 recommended for training stability
-  use_flash_attention: true   # Enable Flash Attention 2 for efficiency
+  dtype: "bfloat16"     # bfloat16 recommended for training stability (auto-adjusted for MPS)
+  use_flash_attention: true   # Enable Flash Attention 2 for efficiency (CUDA only, auto-disabled on other devices)
   gradient_checkpointing: true  # Enable to save VRAM
   trust_remote_code: false
   
@@ -46,15 +68,18 @@ surrogate:
   prob_threshold: 0.03
   # Maximum tokens to consider per position (for memory efficiency)
   max_tokens: 100
-  enabled: true     # Set to false to disable surrogate guidance
   trust_remote_code: true
   # Surrogate loss weight scheduler (cosine decay)
   loss_weight_initial: 1.0  # Starting weight for surrogate loss
   loss_weight_final: 0.0    # Final weight (decays to this via cosine schedule)
 
-# Distillation configuration
-distillation:
-  mode: "surrogate"           # "surrogate", "kd", or "none"
+# SDCE (Surrogate-guided Distillation Cross-Entropy) configuration
+sdce:
+  # Mode controls whether surrogate model is used:
+  #   "surrogate" - Use SDCE loss (surrogate guides via soft token targets)
+  #   "kd"        - Use standard knowledge distillation loss
+  #   "none"      - No surrogate, pure cross-entropy training
+  mode: "none"
   
   # Knowledge Distillation (KD) specific parameters
   # Only used when mode: "kd"
@@ -83,8 +108,8 @@ training:
   output_dir: "./outputs/tinyllama-1.1b-scratch-openwebtext"
   num_epochs: 1                     # For pretraining, often 1-2 epochs over large data
   
-  # Batch size tuned for 4090 (24GB) with gradient checkpointing
-  # Effective batch size = 4 * 16 = 64
+  # Batch size PER DEVICE (will be multiplied by world_size for effective batch)
+  # With torchrun --nproc_per_node=4, effective batch = 4 * 4 * 16 = 256
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 16
@@ -95,10 +120,31 @@ training:
   max_grad_norm: 1.0
   lr_scheduler_type: "cosine"
   
-  # Device selection
-  device: "auto"                    # Will auto-detect CUDA
+  # =============================================================================
+  # DEVICE SELECTION
+  # =============================================================================
+  # Options:
+  #   "auto"   - Auto-detect best available device (CUDA > MPS > CPU)
+  #              For multi-GPU with torchrun, each process gets its assigned GPU
+  #   "cuda"   - Use NVIDIA GPU (supports Flash Attention, GradScaler, DDP)
+  #   "cuda:0" - Use specific CUDA device (not recommended with torchrun)
+  #   "mps"    - Use Apple Silicon GPU (M1/M2/M3)
+  #   "tpu"    - Use Google TPU (requires torch_xla)
+  #   "cpu"    - Use CPU only
+  #
+  # For multi-GPU: Use "auto" or "cuda" and launch with torchrun
+  # For TPU: Set environment variable USE_TPU=1 or use --device tpu
+  device: "auto"
   
-  # Mixed precision - bf16 recommended for training stability
+  # =============================================================================
+  # MIXED PRECISION - AUTO-ADJUSTED PER DEVICE
+  # =============================================================================
+  # Options: "bf16", "fp16", "fp32"
+  # Notes:
+  #   - bf16: Recommended for CUDA and TPU (best stability, no GradScaler needed)
+  #   - fp16: Works on CUDA and MPS (uses GradScaler for stability)
+  #   - fp32: Full precision, works everywhere but slower
+  # MPS note: bfloat16 auto-converts to float16 on Apple Silicon
   mixed_precision: "bf16"
   
   # Logging and checkpointing
@@ -111,10 +157,10 @@ training:
   use_z_loss: true
   z_loss_multiplier: 1.0e-4
   
-  # Random seed
-  seed: 42
+  # Random seed (automatically adjusted per rank in distributed training)
+  seed: 67
   
-  # Weights & Biases logging
+  # Weights & Biases logging (only logs from rank 0 in distributed)
   wandb_project: "SDCE"
   wandb_run_name: "tinyllama-1.1b-openwebtext-baseline"
   wandb_entity: "nathanngtruong-university-of-california-berkeley"
