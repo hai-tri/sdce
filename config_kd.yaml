@@ -1,0 +1,186 @@
+# Surrogate-Assisted Language Model Training Configuration
+# =========================================================
+# Pretraining TinyLlama 1.1B from scratch on OpenWebText
+# Supports: CUDA (single/multi-GPU), MPS (Apple Silicon), TPU, and CPU
+#
+# =============================================================================
+# DISTRIBUTED TRAINING GUIDE
+# =============================================================================
+#
+# Single GPU / CPU / MPS:
+#   python train.py --config config.yaml
+#
+# Multi-GPU with torchrun (RECOMMENDED):
+#   torchrun --nproc_per_node=4 train.py --config config.yaml
+#   torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=<MASTER_IP> --master_port=29500 train.py --config config.yaml
+#
+# Multi-GPU with torch.distributed.launch (LEGACY):
+#   python -m torch.distributed.launch --nproc_per_node=4 train.py --config config.yaml
+#
+# TPU:
+#   USE_TPU=1 python train.py --config config.yaml --tpu-cores 8
+#
+# SLURM cluster example:
+#   srun --ntasks=8 --gpus-per-task=1 torchrun --nproc_per_node=1 train.py --config config.yaml
+#
+# =============================================================================
+
+# Storage configuration - specify where to store models, datasets, and outputs
+storage:
+  # Base directory for all storage (can be absolute or relative path)
+  base_dir: "./storage"
+  
+  # Subdirectories (relative to base_dir, or absolute paths)
+  models_dir: "models"              # Downloaded/cached models
+  datasets_dir: "datasets"          # Downloaded/cached datasets  
+  checkpoints_dir: "checkpoints"    # Training checkpoints
+  logs_dir: "logs"                  # Training logs
+  
+  # HuggingFace cache settings
+  use_hf_cache: false               # If true, use default HF cache instead of storage dirs
+  
+  # Set HF environment variables automatically
+  set_hf_env_vars: true             # Sets HF_HOME, HF_DATASETS_CACHE, TRANSFORMERS_CACHE
+
+# Base model configuration
+model:
+  name_or_path: "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"  # Architecture source
+  dtype: "bfloat16"     # bfloat16 recommended for training stability (auto-adjusted for MPS)
+  use_flash_attention: true   # Enable Flash Attention 2 for efficiency (CUDA only, auto-disabled on other devices)
+  gradient_checkpointing: true  # Enable to save VRAM
+  trust_remote_code: false
+  
+  # IMPORTANT: Initialize weights randomly for pretraining from scratch
+  init_from_scratch: true
+  
+  # Optional: Override model config parameters
+  # custom_config:
+  #   hidden_size: 2048
+  #   num_hidden_layers: 22
+  #   num_attention_heads: 32
+
+# Surrogate model configuration
+surrogate:
+  name_or_path: "Qwen/Qwen3-0.6B"  # Surrogate model for guidance
+  dtype: "bfloat16"
+  # Probability threshold for token selection (replaces fixed k)
+  # Selects all surrogate tokens with probability > prob_threshold
+  prob_threshold: 0.03
+  # Maximum tokens to consider per position (for memory efficiency)
+  max_tokens: 100
+  trust_remote_code: true
+  # Surrogate loss weight scheduler (cosine decay)
+  loss_weight_initial: 1.0  # Starting weight for surrogate loss
+  loss_weight_final: 0.0    # Final weight (decays to this via cosine schedule)
+
+# SDCE (Surrogate-guided Distillation Cross-Entropy) configuration
+sdce:
+  # Mode controls whether surrogate model is used:
+  #   "surrogate" - Use SDCE loss (surrogate guides via soft token targets)
+  #   "kd"        - Use standard knowledge distillation loss
+  #   "none"      - No surrogate, pure cross-entropy training
+  mode: "kd"
+  
+  # Knowledge Distillation (KD) specific parameters
+  # Only used when mode: "kd"
+  kd_temperature: 4.0
+  kd_alpha: 0.5
+  
+  # Alpha scheduling (optional, for "kd" mode)
+  kd_alpha_schedule: false
+  kd_alpha_initial: 0.9
+  kd_alpha_final: 0.1
+
+# Data configuration
+data:
+  dataset_name: "openwebtext"       # OpenWebText dataset
+  dataset_config: null              # No config needed for openwebtext
+  dataset_split: "train"
+  # OpenWebText has no validation split, so we create one
+  eval_split: "validation"          # Will be auto-created
+  eval_ratio: 0.005                 # 0.5% of data for evaluation (standard ratio)
+  text_column: "text"
+  max_seq_length: 2048              # TinyLlama supports 2048 context
+  preprocessing_num_workers: 8      # Increase for faster preprocessing
+
+# Training configuration
+training:
+  output_dir: "./outputs/tinyllama-1.1b-scratch-openwebtext"
+  num_epochs: 1                     # For pretraining, often 1-2 epochs over large data
+  
+  # Batch size PER DEVICE (will be multiplied by world_size for effective batch)
+  # With torchrun --nproc_per_node=4, effective batch = 4 * 4 * 16 = 256
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 16
+  
+  learning_rate: 3.0e-4             # Higher LR typical for pretraining from scratch
+  weight_decay: 0.1                 # Higher weight decay for pretraining
+  warmup_ratio: 0.01                # ~1% warmup is common for pretraining
+  max_grad_norm: 1.0
+  lr_scheduler_type: "cosine"
+  
+  # =============================================================================
+  # DEVICE SELECTION
+  # =============================================================================
+  # Options:
+  #   "auto"   - Auto-detect best available device (CUDA > MPS > CPU)
+  #              For multi-GPU with torchrun, each process gets its assigned GPU
+  #   "cuda"   - Use NVIDIA GPU (supports Flash Attention, GradScaler, DDP)
+  #   "cuda:0" - Use specific CUDA device (not recommended with torchrun)
+  #   "mps"    - Use Apple Silicon GPU (M1/M2/M3)
+  #   "tpu"    - Use Google TPU (requires torch_xla)
+  #   "cpu"    - Use CPU only
+  #
+  # For multi-GPU: Use "auto" or "cuda" and launch with torchrun
+  # For TPU: Set environment variable USE_TPU=1 or use --device tpu
+  device: "auto"
+  
+  # =============================================================================
+  # MIXED PRECISION - AUTO-ADJUSTED PER DEVICE
+  # =============================================================================
+  # Options: "bf16", "fp16", "fp32"
+  # Notes:
+  #   - bf16: Recommended for CUDA and TPU (best stability, no GradScaler needed)
+  #   - fp16: Works on CUDA and MPS (uses GradScaler for stability)
+  #   - fp32: Full precision, works everywhere but slower
+  # MPS note: bfloat16 auto-converts to float16 on Apple Silicon
+  mixed_precision: "bf16"
+  
+  # Logging and checkpointing
+  logging_steps: 50
+  eval_steps: 2000                  # Evaluate every 2k steps
+  save_steps: 5000                  # Save checkpoint every 5k steps
+  save_total_limit: 3               # Keep only last 3 checkpoints
+  
+  # Auxiliary loss (from PaLM) - helps with training stability
+  use_z_loss: true
+  z_loss_multiplier: 1.0e-4
+  
+  # Random seed (automatically adjusted per rank in distributed training)
+  seed: 67
+  
+  # Weights & Biases logging (only logs from rank 0 in distributed)
+  wandb_project: "SDCE"
+  wandb_run_name: "tinyllama-1.1b-openwebtext-kd"
+  wandb_entity: "nathanngtruong-university-of-california-berkeley"
+
+# Benchmark evaluation configuration
+evaluation:
+  enabled: true
+  eval_interval: 10000              # Run benchmarks every 10k steps
+  
+  tasks:
+    - "hellaswag"
+    - "piqa"
+    - "winogrande"
+    - "boolq"
+    - "arc_challenge"
+    - "lambada_openai"
+    
+  num_fewshot: 0
+  batch_size: 8
+  limit: null
+  
+  log_individual_tasks: true
+  log_aggregate_score: true
