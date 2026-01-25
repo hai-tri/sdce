@@ -56,6 +56,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -1008,7 +1009,6 @@ def load_training_data(
         dataset = load_dataset(
             config.dataset_name,
             config.dataset_config,
-            trust_remote_code=True,
         )
         
         train_texts = dataset[config.dataset_split][config.text_column]
@@ -1333,12 +1333,18 @@ class SurrogateTrainer:
         # For TPU, use fewer workers to avoid issues
         num_workers = 0 if self.is_tpu else self.config.data.preprocessing_num_workers
         
+        collate = partial(
+            collate_fn,
+            pad_token_id=pad_token_id,
+            max_length=self.config.data.max_seq_length,
+        )
+
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.training.per_device_train_batch_size,
             sampler=train_sampler,
             shuffle=(train_sampler is None),
-            collate_fn=lambda b: collate_fn(b, pad_token_id, self.config.data.max_seq_length),
+            collate_fn=collate,
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=True,
@@ -1354,7 +1360,7 @@ class SurrogateTrainer:
                 self.eval_dataset,
                 batch_size=self.config.training.per_device_eval_batch_size,
                 shuffle=False,
-                collate_fn=lambda b: collate_fn(b, pad_token_id, self.config.data.max_seq_length),
+                collate_fn=collate,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
             )
